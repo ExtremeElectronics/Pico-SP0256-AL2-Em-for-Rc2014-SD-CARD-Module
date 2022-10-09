@@ -1,4 +1,9 @@
-# Pico-SP0256-AL2-Em-for-Rc2014-
+# Pico-SP0256-AL2-Em-for-Rc2014
+
+This uses the RC2014 SD module available HERE https://z80kits.com/shop/micro-sd-card-module/ with the address set to P40
+
+The SD card or reader is not required.
+
 ## SPO256al2 Emulation for a Z80 / RC2014 BUS 
 ## Sound
 
