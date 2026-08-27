@@ -20,7 +20,7 @@ target_link_libraries(z80spo256al2  PRIVATE
 	hardware_dma
 	pico_multicore
 	hardware_gpio
-
+	hardware_pwm
 )
 
 pico_enable_stdio_usb(z80spo256al2  1)
