@@ -35,3 +35,7 @@ Sending a text stream to BASE+3 terminated in a \n will send plain text via an e
 An extension library is also used for some hard to pronounce words. 
 
 For examples, look in the basic examples folder
+
+### Trace ###
+Trace can be turned on by shorting GPIO27 to +3v3
+and can be viewed via USB serial at 156.2kbd
