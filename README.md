@@ -1,4 +1,4 @@
-# Pico-SP0256-AL2-Em-for-Rc2014
+# Pico SP0256-AL2 and CTS265-AL2 Emulator for RC2014 #
 
 This uses the RC2014 SD module available HERE https://z80kits.com/shop/micro-sd-card-module/ with the address set to P40
 
@@ -12,6 +12,8 @@ Beep
 
 A background frequency generator can be accessed via Port BASE+1 There are 126 notes defined 1-127 (from MIDI notes) sending either 0 or >128 will silence the currently playing note.
 
+## SP0256-AL2 ##
+
 For examples, look in the basic examples folder
 SP0256-AL2
 
@@ -19,8 +21,17 @@ An Emulation of the SPO256-al2 chip can be accessed on port BASE+0 Sending a val
 
 See my SPO256-AL2 Git folder https://github.com/ExtremeElectronics/SP0256-AL2-Pico-Emulation-Detail for more information. Especially the Additional folder https://github.com/ExtremeElectronics/SP0256-AL2-Pico-Emulation-Detail/tree/main/Additional
 
-BASIC examples for sound are in the BASIC Examples folder and a script to create alophone data in BASIC is here https://extkits.co.uk/sp0256-al2/
+BASIC examples for sound are in the BASIC Examples folder and a script to create allophone data in BASIC is here https://extkits.co.uk/sp0256-al2/
 
-The Allophone (decimal) numbers can be sourced from "Allophone DataSheet Addendum.txt" and the full data sheet is also in this directory which should give you an idea how to use it.
+The Allophone (decimal) numbers can be sourced from "Allophone Data Sheet Addendum.txt" and the full data sheet is also in this directory which should give you an idea how to use it.
+
+The Frequency of the SPO256-AL2 can be set using BASE+2 values from 85-95 (0x51-0x5F) are usable
+
+For examples, look in the basic examples folder
+
+## CTS256-AL2 ##
+
+Sending a text stream to BASE+3 terminated in a \n will send plain text via an emulation of the CTS265-AL2 to the SPO256-AL2
+An extension library is also used for some hard to pronounce words. 
 
 For examples, look in the basic examples folder
