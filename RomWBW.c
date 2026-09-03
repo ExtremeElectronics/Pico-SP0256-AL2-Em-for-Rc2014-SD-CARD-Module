@@ -1,0 +1,3001 @@
+/*
+ *	Platform features
+ *
+ *	Z80 at 7.372MHz
+ *	Zilog SIO/2 at 0x80-0x83
+ *	IDE at 0x10-0x17 no high or control access
+ *	16550A at 0xA0
+ *
+ *
+ */
+
+//define to use ROMWBW PCB kit
+//undefine to use RC2040 PCB kit
+#define RCROMWBW 1
+
+//define to add display
+//undefine to remove display also moves usb/uart switch to GPIO12
+#define WithDisplay 1
+
+//define for Pico II
+#ifdef PICO_RP2350
+//define to try FFS from AUX Button (may be broken'ish)
+//undefine to disable
+//only available on 2350 due to RAM
+#define FFS_ENABLE 1
+#endif
+
+#include <stdio.h>
+
+//pico headers
+#include "pico/stdlib.h"
+#include "hardware/gpio.h"
+#include "hardware/uart.h"
+#include "hardware/irq.h"
+#include "pico/multicore.h"
+#include "hardware/flash.h" //AR-gh!
+#include "hardware/clocks.h"
+
+//iniparcer
+#include "dictionary.h"
+#include "iniparser.h"
+
+//sd card reader
+#include "ff.h"
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <time.h>
+#include <unistd.h>
+#include <errno.h>
+#include <tusb.h>
+#include "system.h"
+#include "libz80/z80.h"
+
+#include "acia.h"
+#include "ide.h"
+#include "z80dma.h"
+#include "z80dis.h"
+
+#include "malloc.h"
+
+#include "CTS256_AL2.c"
+//#include "rules_array.c"
+
+//#define FFS True
+
+//ide file handles
+FIL fili;
+FIL fild;
+FIL fild1;
+
+//serial file transfer
+#include "serialfile.h"
+
+//spo256al2
+//pico SDK includes
+#include "hardware/pwm.h"
+
+//sp0256al2 includes
+#include "allophones.c"
+#include "allophoneDefs.h"
+#define MAXALLOPHONE 64
+
+//sound 
+#include "sounds.c"
+uint16_t disksound_pointer=0;
+volatile uint8_t playing_disk=1; 
+uint16_t disksound_timer=0;
+#define PWMrate 90
+//must be pins on the same slice
+#ifndef DevBoard
+#define soundIO1 15
+#define soundIO2 14
+#endif
+
+#ifdef DevBoard
+#define soundIO1 20
+#define soundIO2 21
+#endif
+
+uint PWMslice;
+//SPO/CTS default ports
+uint8_t SPO256Port=0x28;
+uint8_t SPO256FreqPort=0x2a;
+uint8_t CTS256Port=0x2b;
+//set to pipe stdio to CTS
+uint8_t CTS_out=0; 
+//SPO Data flags
+volatile static uint8_t SPO256DataOut;
+volatile static uint8_t SPO256DataReady=0;
+volatile static uint8_t SPO256FreqPortData=90;
+volatile static uint8_t CTS256DataOut;
+//CTS sentance size
+#define SENTANCEMAX  1024
+void AddToSentance(char c);
+//CTS Data Flags
+volatile static uint8_t CTS256DataReady=0;
+char Sentance[SENTANCEMAX]={' ',0};
+uint16_t SentPos=0;
+//allophone buffer
+uint8_t allophoneIn=0;
+uint8_t allophoneOut=0;
+
+//Beep
+#include "midiNotes.h"
+uint8_t BeepPort=0x29;
+volatile static uint8_t BeepDataOut;
+volatile static uint8_t BeepDataReady=0;
+
+//NeoPixel
+#include "hardware/pio.h"
+#include "hardware/dma.h"
+#include "ws2812.pio.h"
+
+uint8_t GetNeoData(uint8_t addr);
+
+#define NUM_PIXELS 128
+#define PIXEL_PIN 22
+//True for RGBW , False for RGB Neopixels
+#define RGBW 0
+
+uint8_t NeoPixelPort=0x40;
+uint8_t NeoPortAddr;
+uint8_t NeoPortData;
+uint8_t NeoPortDataReady=0;
+uint8_t pixels[NUM_PIXELS][3];
+uint8_t pixelspallette[256][3];
+
+
+//watch
+uint16_t watch= 0x0000;
+
+//flash
+#define FLASH_TARGET_OFFSET (1024 * 1024)
+
+//RAMROM
+#ifdef PICO_RP2350
+  #define pagesize 0x4000 //16k pages
+  #define rampages 20  //20=320K pico allows cpm 3
+  #define rompages 32  //32=512K all in flash
+#endif
+
+#ifdef PICO_RP2040
+  #define pagesize 0x4000 //16k pages
+  #define rampages 10  //8=128K pico allows cpm 3
+  #define rompages 32  //32=512K all in flash
+#endif
+
+uint8_t ram[rampages][pagesize]; //128k
+
+static uint8_t overridejumpers=0; //take address from ini if set in ini
+
+//Set ROM Base ADDRESS
+const uint8_t *rom = (const uint8_t *) (XIP_BASE + FLASH_TARGET_OFFSET);
+
+//page memory registers maps registers on 512rma/512rom card
+uint8_t pmr[5]={0,0,0,0,0}; // 0x78-0x7c
+
+/* use stdio for errors via usb uart */
+/* use 0=UART or 1=USB for serial comms */
+/* 3=both for init ONLY */
+int UseUsb=3; 
+
+//IDE
+static int ide =1; //set to 1 to init IDE
+struct ide_controller *ide0;
+
+/* Real UART setup*/
+#define UART_ID uart0
+#define BAUD_RATE 115200
+#define DATA_BITS 8
+#define STOP_BITS 1
+#define PARITY    UART_PARITY_NONE
+
+// We are using pins 0 and 1, but see the GPIO function select table in the
+// datasheet for information on which other pins can be used.
+#define UART_TX_PIN 0
+#define UART_RX_PIN 1
+
+char usbcharbuf=0;
+int hasusbcharwaiting=0;
+
+//acia
+int have_acia = 0;
+
+struct acia *acia;
+static uint8_t acia_narrow;
+
+//serial in circular buffer
+#define INBUFFERSIZE 8000
+static char charbufferUART[INBUFFERSIZE];
+static int charinUART=0;
+static int charoutUART=0;
+
+//usb serial buffer
+static char charbufferUSB[INBUFFERSIZE];
+static int charinUSB=0;
+static int charoutUSB=0;
+
+//PIO
+int PIOA=0;
+
+#ifdef RCROMWBW
+uint8_t PIOAp[]={26,22,21,20,19,18,17,16};
+#endif
+
+#ifndef RCROMWBW
+uint8_t PIOAp[]={16,17,18,19,20,21,26,27};
+#endif
+
+
+//PICO GPIO
+// use regular LED on pico if NOT WBW PCB (gpio 25 most likly)
+//#ifdef RCROMWBW
+const uint DISKLED = 10; //Rom WBW PCB LED
+//#endif
+//#ifndef RCROMWBW
+//const uint DISKLED = PICO_DEFAULT_LED_PIN;
+//#endif
+
+
+//serial selection
+#ifndef WithDisplay
+const uint SERSEL = 13;
+#endif
+#ifdef WithDisplay
+const uint SERSEL = 11;
+#endif
+
+
+//buttons
+const uint DUMPBUT =9;
+const uint AUXBUT =8;
+const uint RESETBUT =7;
+
+//LED
+const uint AUXLED =6;
+
+/* use stdio for errors via usb uart */
+
+/* Real UART setup*/
+#define UART_ID uart0
+#define BAUD_RATE 115200
+#define DATA_BITS 8
+#define STOP_BITS 1
+#define PARITY    UART_PARITY_NONE
+
+// We are using pins 0 and 1, but see the GPIO function select table in the
+// datasheet for information on which other pins can be used.
+#define UART_TX_PIN 0
+#define UART_RX_PIN 1
+
+//Display
+#ifdef WithDisplay
+
+#define CGRAMMAX 0x40
+#define DDRAMMAX 0x80
+#define DisplayDebug 0 //set to 1 to add debug output
+int DisplayRegPort=0xda;
+int DisplayDataPort=0xdb;
+
+uint8_t DisplayIR=0;
+uint8_t DisplayDR=0;
+uint8_t DisplayBusy=0;
+uint8_t DisplayAddress=0;
+uint8_t DisplayAC=0;
+uint8_t DisplayACGADD=0;
+uint8_t DisplayOn=0;
+uint8_t DisplayID=0;
+uint8_t DisplayShift=0;
+uint8_t DisplayCursorOn=0;
+uint8_t DisplayBlinkOn=0;
+uint8_t DisplayRight=0;
+uint8_t DisplayFont=0;
+uint8_t DisplayCGRAM[CGRAMMAX];
+uint8_t DisplayDDRAM[DDRAMMAX];
+uint8_t DisplayLines=0;
+uint8_t DisplayDirty=0;
+
+
+//I2c Settings
+#define I2CInst i2c0 //also in Romwbw.h ... yes I know!
+#define I2C_SDA_PIN 12
+#define I2C_SCL_PIN 13
+#define I2C_BAUDRATE 200000 //200Khz
+
+#include "display/display.h"
+#include "display/assets.h"
+
+#endif
+
+static uint8_t switchrom = 1;
+
+static uint8_t have_ctc;
+static uint8_t have_16x50;
+static uint8_t fast = 0;
+static uint8_t int_recalc = 0;
+
+//Emulaton speed tweaks.
+static uint16_t tstate_steps = 500;
+//300 better for speed (core). 20 better for IO
+#define IOMAX 20
+#define IOMIN 400
+static uint16_t IoTimeShare = 200;
+
+
+/* IRQ source that is live in IM2 */
+static uint8_t live_irq;
+
+#define IRQ_SIOA	1
+#define IRQ_SIOB	2
+#define IRQ_CTC		3	/* 3 4 5 6 */
+
+static Z80Context cpu_z80;
+
+volatile int emulator_done;
+
+#define TRACE_MEM	0x000001
+#define TRACE_IO	0x000002
+#define TRACE_ROM	0x000004
+#define TRACE_UNK	0x000008
+#define TRACE_CPU	0x000010
+#define TRACE_512	0x000020
+#define TRACE_RTC	0x000040
+#define TRACE_SIO	0x000080
+#define TRACE_CTC	0x000100
+#define TRACE_CPLD	0x000200
+#define TRACE_IRQ	0x000400
+#define TRACE_UART	0x000800
+#define TRACE_Z84C15	0x001000
+#define TRACE_IDE	0x002000
+#define TRACE_SPI	0x004000
+#define TRACE_SD	0x008000
+#define TRACE_PPIDE	0x010000
+#define TRACE_COPRO	0x020000
+#define TRACE_COPRO_IO	0x040000
+#define TRACE_TMS9918A  0x080000
+#define TRACE_FDC	0x100000
+#define TRACE_PS2	0x200000
+#define TRACE_ACIA	0x400000
+#define TRACE_BANK      0x800000 
+
+int trace = 0;
+
+static void reti_event(void);
+
+static unsigned int nbytes;
+
+uint32_t getTotalHeap(void) {
+   extern char __StackLimit, __bss_end__;
+   
+   return &__StackLimit  - &__bss_end__;
+}
+
+uint32_t getFreeHeap(void) {
+   struct mallinfo m = mallinfo();
+
+   return getTotalHeap() - m.uordblks;
+}
+
+
+static void z80_vardump(void)
+{
+	static uint32_t lastpc = -1;
+	nbytes = 0;
+
+	lastpc = cpu_z80.M1PC;
+	printf( "%04X: ", lastpc);
+//	z80_disasm(buf, lastpc);
+	while(nbytes++ < 6)
+		printf( "   ");
+//	printf( "%-16s ", buf);
+	printf( "[ %02X:%02X %04X %04X %04X %04X %04X %04X ]\n",
+		cpu_z80.R1.br.A, cpu_z80.R1.br.F,
+		cpu_z80.R1.wr.BC, cpu_z80.R1.wr.DE, cpu_z80.R1.wr.HL,
+		cpu_z80.R1.wr.IX, cpu_z80.R1.wr.IY, cpu_z80.R1.wr.SP);
+	sleep_ms(2);
+}
+
+//################################################### Memory access #############################################
+
+
+static uint8_t mem_read0(uint16_t addr)
+{
+   uint8_t r;	
+   uint16_t pa=addr & 0x3fff; //bottom 14 lines select address within that bank
+   if (pmr[4]>0){	// banked
+      uint8_t pn=(addr>>14) & 3; //top 2 lines select 16k address space
+      uint8_t bk=pmr[pn]; // get bank number
+      if (bk<32){ //if bank<32 its rom
+            r=rom[bk*pagesize+pa];  //rom[bk][pa];
+            if (trace & TRACE_BANK)  printf( "B%02X(%04X)-", bk,pa);
+            if (trace & TRACE_ROM)  printf( "RO%04X[%02X]\n", addr, r);
+          
+      }else{//if bank greater than or = to 32 its ramf
+//          if(bk>=0x3e){
+
+//          }else{
+              if(bk-32>rampages){
+		  printf("\n******* Ram bank read fail  B%02X(%04X) ********\n", bk,pa);
+		     r=0;
+		  }else{
+		     r=ram[bk-32][pa];
+		     if (trace & TRACE_BANK)  printf( "B%02X(%04X)-", bk,pa);
+		     if (trace & TRACE_MEM)  printf( "RA%04X[%02X]\n", addr, r);
+              }
+//          }
+      }
+   }else{ //not banked, all point to bank 0 (rom)
+      r=rom[pa];
+      if (trace & TRACE_ROM)  printf( "RO%04X(%04x)[%02X]\n", addr,pa, r);
+   }
+   return r;      
+}
+
+void mem_write0(uint16_t addr, uint8_t val)
+{
+   uint8_t r;
+   if (pmr[4]>0){
+      uint8_t pn=(addr>>14) & 3; //top 2 lines select 16k address space
+      uint16_t pa=addr & 0x3fff;  //bottom 14 lines select address within that bank
+      uint8_t bk=pmr[pn]; // get bank number
+      if(bk>=32){ //if bank >32 its ram
+//         if(bk>=0x3e){
+//         }else{ 
+            if(bk-32>rampages){
+                printf("\n******* Ram bank write fail  B%02X(%04X) ********\n", bk,pa);
+            }else{
+               ram[bk-32][pa]=val;      
+               if (trace & TRACE_BANK)  printf( "B%02X-", bk);
+               if (trace & TRACE_MEM)  printf( "W%04X[%02X]\n", addr, val);
+            }   
+//         }    
+      }	      
+      // if its <32 its rom and im not going to try to write to it, so nar...
+   }else{
+      // if banking not enabled its all rom so who cares :) 
+   }
+
+      
+}
+
+uint8_t do_mem_read(uint16_t addr, int quiet){
+      if (watch>0 && addr==watch){        z80_vardump();      }
+  	  return mem_read0(addr);
+}
+
+uint8_t mem_read(int unused, uint16_t addr){
+	static uint8_t rstate = 0;
+	uint8_t r = do_mem_read(addr, 0);
+
+	if (cpu_z80.M1) {
+		/* DD FD CB see the Z80 interrupt manual */
+		if (r == 0xDD || r == 0xFD || r == 0xCB) {
+			rstate = 2;
+			return r;
+		}
+		/* Look for ED with M1, followed directly by 4D and if so trigger
+		   the interrupt chain */
+		if (r == 0xED && rstate == 0) {
+			rstate = 1;
+			return r;
+		}
+	}
+	if (r == 0x4D && rstate == 1)
+		reti_event();
+	rstate = 0;
+	return r;
+}
+
+void mem_write(int unused, uint16_t addr, uint8_t val){
+	 mem_write0(addr, val);
+}
+
+//###################################################### Z80 code Trace / disassemble  ###################################
+
+
+
+uint8_t z80dis_byte(uint16_t addr){
+	uint8_t r = do_mem_read(addr, 1);
+	printf( "%02X ", r);
+	nbytes++;
+	return r;
+}
+
+uint8_t z80dis_byte_quiet(uint16_t addr){
+	return do_mem_read(addr, 1);
+}
+
+static void z80_trace(unsigned unused){
+	static uint32_t lastpc = -1;
+	char buf[256];
+
+	if ((trace & TRACE_CPU) == 0)
+		return;
+	nbytes = 0;
+	/* Spot XXXR repeating instructions and squash the trace */
+	if (cpu_z80.M1PC == lastpc && z80dis_byte_quiet(lastpc) == 0xED &&
+		(z80dis_byte_quiet(lastpc + 1) & 0xF4) == 0xB0) {
+		return;
+	}
+	lastpc = cpu_z80.M1PC;
+	printf( "%04X: ", lastpc);
+	z80_disasm(buf, lastpc);
+	while(nbytes++ < 6)
+		printf( "   ");
+	printf( "%-16s ", buf);
+	printf( "[ %02X:%02X %04X %04X %04X %04X %04X %04X ]\n",
+		cpu_z80.R1.br.A, cpu_z80.R1.br.F,
+		cpu_z80.R1.wr.BC, cpu_z80.R1.wr.DE, cpu_z80.R1.wr.HL,
+		cpu_z80.R1.wr.IX, cpu_z80.R1.wr.IY, cpu_z80.R1.wr.SP);
+}
+
+
+
+
+// ############################################## SIO / ACIA serial support Functions #####################################
+
+// experimental usb char in circular buffer
+
+int intUSBcharwaiting(){
+// no interrupt or waiting check so use unblocking getchar, adds to buff if avai
+    int c = getchar_timeout_us(0);
+      if(c>=0){ // fix for SDK2 by djrose80
+        charbufferUSB[charinUSB]=(char)c;
+        charinUSB++;
+        if (charinUSB==INBUFFERSIZE){
+            charinUSB=0;
+        }
+    }
+    return charinUSB!=charoutUSB;
+}
+
+
+
+int testUSBcharwaiting(){
+   return charinUSB!=charoutUSB;
+}
+
+char getUSBcharwaiting(void){
+    char c=0;
+    if(charinUSB!=charoutUSB){
+        c=charbufferUSB[charoutUSB];
+        charoutUSB++;
+        if (charoutUSB==INBUFFERSIZE){
+            charoutUSB=0;
+        }
+    }else{
+        printf("USB Buffer underrun");
+    }
+  return c;
+}
+
+// experimental UART char in circular buffer rx via USB interrupt
+void intUARTcharwaiting(void){
+//   char c = getchar_timeout_us(0); 
+    while (uart_is_readable(UART_ID)) {
+        char c =uart_getc(UART_ID);
+        charbufferUART[charinUART]=c;
+        charinUART++;
+        if (charinUART==INBUFFERSIZE){
+            charinUART=0;
+        }
+    }
+}
+
+//char waiting test is inbuff=outbuffer?
+int testUARTcharwaiting(){
+      return charinUART!=charoutUART;
+}
+
+
+char getUARTcharwaiting(void){
+    char c=0;
+    if(charinUART!=charoutUART){
+        c=charbufferUART[charoutUART];
+        charoutUART++;
+        if (charoutUART==INBUFFERSIZE){
+            charoutUART=0;
+        }
+    }else{
+        printf("UART Buffer underrun");
+    }
+  return c;
+}
+
+
+unsigned int check_chario(uint8_t s_port){
+   unsigned int r = 0;
+
+   if (UseUsb==s_port){	
+	if(testUARTcharwaiting()){
+	//bodge.. if currently in ACIA interrupt , lie that there is nothng waiting
+	//this prevents overruns
+	    if(have_acia==1){
+	        if(!acia_in_interrupt(acia)){
+                    r|=1;//receive ready
+                }
+            }else{
+                r|=1;
+            }
+            // if we have a char, decrease interrupt latancey
+           IoTimeShare=IOMAX;        
+        }else{
+           // if no chars for a while, increase emulation speed
+           if (IoTimeShare<IOMIN) IoTimeShare++;
+        }
+        if (uart_is_writable(UART_ID )>0)  r |= 2;//transmit ready
+   }else{
+        if(testUSBcharwaiting()){
+         //bodge.. if currently in interrupt , lie that there is nothng waiting
+         //this prevents overruns
+            if(have_acia==1){
+                if(!acia_in_interrupt(acia)){
+                    r|=1;//receive ready
+                }
+            }else{
+                 r|=1;
+            }    
+            // if we have a char, decrease interrupt latancey
+            IoTimeShare=IOMAX;
+       }else{
+            // if no chars for a while, increase emulation speed
+            if (IoTimeShare<IOMIN) IoTimeShare++;
+       }    
+       r |=2; //always ready to tx
+   }
+   return r;
+}
+
+
+unsigned int next_char(uint8_t s_port){
+    char c;
+    if (UseUsb==s_port){
+	//READ UART WITH waiting char
+        //uart_read_blocking(UART_ID,&c,1);
+        c=getUARTcharwaiting();
+    }else{
+        //READ Serial USB WITH waiting char
+        c=getUSBcharwaiting();
+    }
+    return c;
+}
+
+void out_char(char * val,uint8_t s_port){
+    if (UseUsb==s_port){
+        //out via UART
+        uart_write_blocking(UART_ID,val,1);
+    }else{
+       //out via USB serial
+        putchar(*val);
+    }
+    //speak output  
+    if(CTS_out==1){
+        AddToSentance(*val);
+    }
+}
+
+void recalc_interrupts(void){
+	int_recalc = 1;
+}
+
+// ################################################ ACIA #############################################
+
+static void acia_check_irq(struct acia *acia){
+	if (acia_irq_pending(acia))
+		Z80INT(&cpu_z80, 0xFF);	/* FIXME probably last data or bus noise */
+}
+
+
+/* UART: very mimimal for the moment */
+struct uart16x50 {
+    uint8_t ier;
+    uint8_t iir;
+    uint8_t fcr;
+    uint8_t lcr;
+    uint8_t mcr;
+    uint8_t lsr;
+    uint8_t msr;
+    uint8_t scratch;
+    uint8_t ls;
+    uint8_t ms;
+    uint8_t dlab;
+    uint8_t irq;
+#define RXDA	1
+#define TEMT	2
+#define MODEM	8
+    uint8_t irqline;
+    uint8_t input;
+};
+
+static struct uart16x50 uart[1];
+
+static void uarta_init(struct uart16x50 *uptr, int in){
+    uptr->dlab = 0;
+    uptr->input = in;
+}
+
+static void uart_check_irq(struct uart16x50 *uptr){
+    if (uptr->irqline)
+	    Z80INT(&cpu_z80, 0xFF);	/* actually undefined */
+}
+
+/* Compute the interrupt indicator register from what is pending */
+static void uart_recalc_iir(struct uart16x50 *uptr){
+    if (uptr->irq & RXDA)
+        uptr->iir = 0x04;
+    else if (uptr->irq & TEMT)
+        uptr->iir = 0x02;
+    else if (uptr->irq & MODEM)
+        uptr->iir = 0x00;
+    else {
+        uptr->iir = 0x01;	/* No interrupt */
+        uptr->irqline = 0;
+        return;
+    }
+    /* Ok so we have an event, do we need to waggle the line */
+    if (uptr->irqline)
+        return;
+    uptr->irqline = uptr->irq;
+
+}
+
+/* Raise an interrupt source. Only has an effect if enabled in the ier */
+static void uart_interrupt(struct uart16x50 *uptr, uint8_t n){
+    if (uptr->irq & n)
+        return;
+    if (!(uptr->ier & n))
+        return;
+    uptr->irq |= n;
+    uart_recalc_iir(uptr);
+}
+
+static void uart_clear_interrupt(struct uart16x50 *uptr, uint8_t n){
+    if (!(uptr->irq & n))
+        return;
+    uptr->irq &= ~n;
+    uart_recalc_iir(uptr);
+}
+
+static void uart_event(struct uart16x50 *uptr){
+    uint8_t r = check_chario(0);
+    uint8_t old = uptr->lsr;
+    uint8_t dhigh;
+    if (uptr->input && (r & 1))
+        uptr->lsr |= 0x01;	/* RX not empty */
+    if (r & 2)
+        uptr->lsr |= 0x60;	/* TX empty */
+    dhigh = (old ^ uptr->lsr);
+    dhigh &= uptr->lsr;		/* Changed high bits */
+    if (dhigh & 1)
+        uart_interrupt(uptr, RXDA);
+    if (dhigh & 0x2)
+        uart_interrupt(uptr, TEMT);
+}
+
+static void show_settings(struct uart16x50 *uptr){
+    uint32_t baud;
+
+    if (!(trace & TRACE_UART))
+        return;
+
+    baud = uptr->ls + (uptr->ms << 8);
+    if (baud == 0)
+        baud = 1843200;
+    baud = 1843200 / baud;
+    baud /= 16;
+    printf( "[%d:%d",
+            baud, (uptr->lcr &3) + 5);
+    switch(uptr->lcr & 0x38) {
+        case 0x00:
+        case 0x10:
+        case 0x20:
+        case 0x30:
+            printf( "N");
+            break;
+        case 0x08:
+            printf( "O");
+            break;
+        case 0x18:
+            printf( "E");
+            break;
+        case 0x28:
+            printf( "M");
+            break;
+        case 0x38:
+            printf( "S");
+            break;
+    }
+    printf( "%d ",(uptr->lcr & 4) ? 2 : 1);
+
+    if (uptr->lcr & 0x40)printf( "break ");
+    if (uptr->lcr & 0x80)printf( "dlab ");
+    if (uptr->mcr & 1)   printf( "DTR ");
+    if (uptr->mcr & 2)   printf( "RTS ");
+    if (uptr->mcr & 4)   printf( "OUT1 ");
+    if (uptr->mcr & 8)   printf( "OUT2 ");
+    if (uptr->mcr & 16)  printf( "LOOP ");
+    printf( "ier %02x]\n", uptr->ier);
+}
+
+static void uart_write(struct uart16x50 *uptr, uint8_t addr, uint8_t val){
+    switch(addr) {
+    case 0:	/* If dlab = 0, then write else LS*/
+        if (uptr->dlab == 0) {
+            if (uptr == &uart[0]) {
+                //uart_putc(UART_ID,val);
+                out_char(&val,0);
+                //putchar(val);
+                //fflush(stdout);
+            }
+            uart_clear_interrupt(uptr, TEMT);
+            uart_interrupt(uptr, TEMT);
+        } else {
+            uptr->ls = val;
+            show_settings(uptr);
+        }
+        break;
+    case 1:	/* If dlab = 0, then IER */
+        if (uptr->dlab) {
+            uptr->ms= val;
+            show_settings(uptr);
+        }
+        else
+            uptr->ier = val;
+        break;
+    case 2:	/* FCR */
+        uptr->fcr = val & 0x9F;
+        break;
+    case 3:	/* LCR */
+        uptr->lcr = val;
+        uptr->dlab = (uptr->lcr & 0x80);
+        show_settings(uptr);
+        break;
+    case 4:	/* MCR */
+        uptr->mcr = val & 0x3F;
+        break;
+    case 5:	/* LSR (r/o) */
+        break;
+    case 6:	/* MSR (r/o) */
+        break;
+    case 7:	/* Scratch */
+        uptr->scratch = val;
+        break;
+    }
+}
+
+static uint8_t uart_read(struct uart16x50 *uptr, uint8_t addr)
+{
+    uint8_t r;
+
+    switch(addr) {
+    case 0:
+        /* receive buffer */
+        if (uptr == &uart[0] && uptr->dlab == 0) {
+            uart_clear_interrupt(uptr, RXDA);
+            if (check_chario(0) & 1)
+                return next_char(0);
+            return 0x00;
+        } else
+            return uptr->ls;
+        break;
+    case 1:
+        /* IER */
+        if (uptr->dlab == 0)
+            return uptr->ier;
+        return uptr->ms;
+    case 2:
+        /* IIR */
+        return uptr->iir;
+    case 3:
+        /* LCR */
+        return uptr->lcr;
+    case 4:
+        /* mcr */
+        return uptr->mcr;
+    case 5:
+        /* lsr */
+        r = check_chario(0);
+        uptr->lsr &=0x90;
+        if (r & 1)
+             uptr->lsr |= 0x01;	/* Data ready */
+        if (r & 2)
+             uptr->lsr |= 0x60;	/* TX empty | holding empty */
+        /* Reading the LSR causes these bits to clear */
+        r = uptr->lsr;
+        uptr->lsr &= 0xF0;
+        return r;
+    case 6:
+        /* msr */
+        uptr->msr &= 0x7F;
+        r = uptr->msr;
+        /* Reading clears the delta bits */
+        uptr->msr &= 0xF0;
+        uart_clear_interrupt(uptr, MODEM);
+        return r;
+    case 7:
+        return uptr->scratch;
+    }
+    return 0xFF;
+}
+
+
+// ######################################################## SIO ###############################################
+
+struct z80_sio_chan {
+	uint8_t wr[8];
+	uint8_t rr[3];
+	uint8_t data[3];
+	uint8_t dptr;
+	uint8_t irq;
+	uint8_t rxint;
+	uint8_t txint;
+	uint8_t intbits;
+#define INT_TX	1
+#define INT_RX	2
+#define INT_ERR	4
+	uint8_t pending;	/* Interrupt bits pending as an IRQ cause */
+	uint8_t vector;		/* Vector pending to deliver */
+};
+
+static int sio2;
+static int sio2_input;
+static struct z80_sio_chan sio[2];
+
+
+
+/*
+ *	Interrupts. We don't handle IM2 yet.
+ */
+
+static void sio2_clear_int(struct z80_sio_chan *chan, uint8_t m){
+	if (trace & TRACE_IRQ) {
+		printf( "Clear intbits %d %x\n",
+			(int)(chan - sio), m);
+	}
+	chan->intbits &= ~m;
+	chan->pending &= ~m;
+	/* Check me - does it auto clear down or do you have to reti it ? */
+	if (!(sio->intbits | sio[1].intbits)) {
+		sio->rr[1] &= ~0x02;
+		chan->irq = 0;
+	}
+	recalc_interrupts();
+}
+
+static void sio2_raise_int(struct z80_sio_chan *chan, uint8_t m){
+	uint8_t new = (chan->intbits ^ m) & m;
+	chan->intbits |= m;
+	if ((trace & TRACE_SIO) && new)
+		printf( "SIO raise int %x new = %x\n", m, new);
+	if (new) {
+		if (!sio->irq) {
+			chan->irq = 1;
+			sio->rr[1] |= 0x02;
+			recalc_interrupts();
+		}
+	}
+}
+
+static void sio2_reti(struct z80_sio_chan *chan)
+{
+	/* Recalculate the pending state and vectors */
+	/* FIXME: what really goes here */
+	sio->irq = 0;
+	recalc_interrupts();
+}
+
+static int sio2_check_im2(struct z80_sio_chan *chan){
+	uint8_t vector = sio[1].wr[2];
+	/* See if we have an IRQ pending and if so deliver it and return 1 */
+	if (chan->irq) {
+		/* Do the vector calculation in the right place */
+		/* FIXME: move this to other platforms */
+		if (sio[1].wr[1] & 0x04) {
+			/* This is a subset of the real options. FIXME: add
+			   external status change */
+			if (sio[1].wr[1] & 0x04) {
+				vector &= 0xF1;
+				if (chan == sio)vector |= 1 << 3;
+				if (chan->intbits & INT_RX)vector |= 4;
+				else if (chan->intbits & INT_ERR)vector |= 2;
+			}
+			if (trace & TRACE_SIO)
+				printf( "SIO2 interrupt %02X\n", vector);
+			chan->vector = vector;
+		} else {
+			chan->vector = vector;
+		}
+		if (trace & (TRACE_IRQ|TRACE_SIO))
+			printf( "New live interrupt pending is SIO (%d:%02X).\n",
+				(int)(chan - sio), chan->vector);
+		if (chan == sio)
+			live_irq = IRQ_SIOA;
+		else
+			live_irq = IRQ_SIOB;
+		Z80INT(&cpu_z80, chan->vector);
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ *	The SIO replaces the last character in the FIFO on an
+ *	overrun.
+ */
+static void sio2_queue(struct z80_sio_chan *chan, uint8_t c)
+{
+	if (trace & TRACE_SIO)
+		printf( "SIO %d queue %d: ", (int) (chan - sio), c);
+	/* Receive disabled */
+	if (!(chan->wr[3] & 1)) {
+		printf( "RX disabled.\n");
+		return;
+	}
+	/* Overrun */
+	if (chan->dptr == 2) {
+		if (trace & TRACE_SIO)
+			printf( "Overrun.\n");
+		chan->data[2] = c;
+		chan->rr[1] |= 0x20;	/* Overrun flagged */
+		/* What are the rules for overrun delivery FIXME */
+		sio2_raise_int(chan, INT_ERR);
+	} else {
+		/* FIFO add */
+		if (trace & TRACE_SIO)
+			printf( "Queued %d (mode %d)\n", chan->dptr, chan->wr[1] & 0x18);
+		chan->data[chan->dptr++] = c;
+		chan->rr[0] |= 1;
+		switch (chan->wr[1] & 0x18) {
+		case 0x00:
+			break;
+		case 0x08:
+			if (chan->dptr == 1)sio2_raise_int(chan, INT_RX);
+			break;
+		case 0x10:
+		case 0x18:
+			sio2_raise_int(chan, INT_RX);
+			break;
+		}
+	}
+	/* Need to deal with interrupt results */
+}
+
+static void sio2_channel_timer(struct z80_sio_chan *chan, uint8_t ab){
+    if (ab == 0) {
+	int c = check_chario(0);
+//	printf("Check chario %i %i \n\r",c,sio2_input);
+	if (sio2_input) {
+	    if (c & 1){
+		if(chan->dptr<1){ //prevent overrun
+		    sio2_queue(chan, next_char(0));
+//		    printf("Added to q");
+		}
+	    }
+	}
+	if (c & 2) {
+    	     if (!(chan->rr[0] & 0x04)) {
+		 chan->rr[0] |= 0x04;
+	         if (chan->wr[1] & 0x02) sio2_raise_int(chan, INT_TX);
+	     }
+	}
+    } else {
+  	int c = check_chario(1);
+//	printf("Check chario %i %i \n\r",c,sio2_input);
+	if (sio2_input) {
+	    if (c & 1){
+		 if(chan->dptr<1){ //prevent overrun
+		     sio2_queue(chan, next_char(1));
+//		     printf("Added to q");
+	   	 }
+	    }
+	}
+	if (c & 2) {
+	    if (!(chan->rr[0] & 0x04)) {
+	        chan->rr[0] |= 0x04;
+		if (chan->wr[1] & 0x02) sio2_raise_int(chan, INT_TX);
+	    }
+	}
+	
+    }
+}
+
+static void sio2_timer(void){
+	sio2_channel_timer(sio, 0);
+	sio2_channel_timer(sio + 1, 1);
+}
+
+static void sio2_channel_reset(struct z80_sio_chan *chan)
+{
+	chan->rr[0] = 0x2C;
+	chan->rr[1] = 0x01;
+	chan->rr[2] = 0;
+	sio2_clear_int(chan, INT_RX | INT_TX | INT_ERR);
+}
+
+static void sio_reset(void)
+{
+	sio2_channel_reset(sio);
+	sio2_channel_reset(sio + 1);
+}
+
+static uint8_t sio2_read(uint16_t addr){
+	struct z80_sio_chan *chan = (addr & 2) ? sio + 1 : sio;
+	if (!(addr & 1)) {
+	    /* Control */
+	    uint8_t r = chan->wr[0] & 007;
+	    chan->wr[0] &= ~007;
+
+	    chan->rr[0] &= ~2;
+	    if (chan == sio && (sio[0].intbits | sio[1].intbits))chan->rr[0] |= 2;
+	    if (trace & TRACE_SIO)printf( "sio%c read reg %d = ", (addr & 2) ? 'b' : 'a', r);
+		switch (r) {
+		case 0:
+		case 1:
+		    if (trace & TRACE_SIO)printf( "%02X\n", chan->rr[r]);
+		    return chan->rr[r];
+		case 2:
+		    if (chan != sio) {
+			if (trace & TRACE_SIO) printf( "%02X\n", chan->rr[2]);
+			return chan->rr[2];
+		    }
+		case 3:
+			/* What does the hw report ?? */
+//			printf( "INVALID SIO READ (0xFF)\n");
+			return 0xFF;
+		}
+	} else {
+		/* FIXME: irq handling */
+		uint8_t c = chan->data[0];
+		chan->data[0] = chan->data[1];
+		chan->data[1] = chan->data[2];
+		if (chan->dptr)
+			chan->dptr--;
+		if (chan->dptr == 0)
+			chan->rr[0] &= 0xFE;	/* Clear RX pending */
+		sio2_clear_int(chan, INT_RX);
+		chan->rr[0] &= 0x3F;
+		chan->rr[1] &= 0x3F;
+		if (trace & TRACE_SIO)
+			printf( "sio%c read data %d\n", (addr & 2) ? 'b' : 'a', c);
+		if (chan->dptr && (chan->wr[1] & 0x10))
+			sio2_raise_int(chan, INT_RX);
+		return c;
+	}
+	return 0xFF;
+}
+
+static void sio2_write(uint16_t addr, uint8_t val)
+{
+	struct z80_sio_chan *chan = (addr & 2) ? sio + 1 : sio;
+	uint8_t r;
+	if (!(addr & 1)) {
+		if (trace & TRACE_SIO)
+			printf( "sio%c write reg %d with %02X\n", (addr & 2) ? 'b' : 'a', chan->wr[0] & 7, val);
+		switch (chan->wr[0] & 007) {
+		case 0:
+			chan->wr[0] = val;
+			/* FIXME: CRC reset bits ? */
+			switch (val & 070) {
+			case 000:	/* NULL */
+				break;
+			case 010:	/* Send Abort SDLC */
+				/* SDLC specific no-op for async */
+				break;
+			case 020:	/* Reset external/status interrupts */
+				sio2_clear_int(chan, INT_ERR);
+				chan->rr[1] &= 0xCF;	/* Clear status bits on rr0 */
+				break;
+			case 030:	/* Channel reset */
+				if (trace & TRACE_SIO)
+					printf( "[channel reset]\n");
+				sio2_channel_reset(chan);
+				break;
+			case 040:	/* Enable interrupt on next rx */
+				chan->rxint = 1;
+				break;
+			case 050:	/* Reset transmitter interrupt pending */
+				chan->txint = 0;
+				sio2_clear_int(chan, INT_TX);
+				break;
+			case 060:	/* Reset the error latches */
+				chan->rr[1] &= 0x8F;
+				break;
+			case 070:	/* Return from interrupt (channel A) */
+				if (chan == sio) {
+					sio->irq = 0;
+					sio->rr[1] &= ~0x02;
+					sio2_clear_int(sio, INT_RX | INT_TX | INT_ERR);
+					sio2_clear_int(sio + 1, INT_RX | INT_TX | INT_ERR);
+				}
+				break;
+			}
+			break;
+		case 1:
+		case 2:
+		case 3:
+		case 4:
+		case 5:
+		case 6:
+		case 7:
+			r = chan->wr[0] & 7;
+			if (trace & TRACE_SIO)
+				printf( "sio%c: wrote r%d to %02X\n",
+					(addr & 2) ? 'b' : 'a', r, val);
+			chan->wr[r] = val;
+			if (chan != sio && r == 2)
+				chan->rr[2] = val;
+			chan->wr[0] &= ~007;
+			break;
+		}
+		/* Control */
+	} else {
+		/* Strictly we should emulate this as two bytes, one going out and
+		   the visible queue - FIXME */
+		/* FIXME: irq handling */
+		chan->rr[0] &= ~(1 << 2);	/* Transmit buffer no longer empty */
+		chan->txint = 1;
+		/* Should check chan->wr[5] & 8 */
+		sio2_clear_int(chan, INT_TX);
+		if (trace & TRACE_SIO)
+			printf( "sio%c write data %d\n", (addr & 2) ? 'b' : 'a', val);
+		if (chan == sio)
+//			write(1, &val, 1);
+			out_char(&val,0);
+		else {
+//			write(1, "\033[1m;", 5);
+			//write(1, &val,1);
+			out_char(&val,1);
+//			write(1, "\033[0m;", 5);
+		}
+	}
+}
+
+
+
+// ################################################### IDE ###############################
+
+
+static uint8_t my_ide_read(uint16_t addr)
+{
+	uint8_t r =  ide_read8(ide0, addr);
+	if (trace & TRACE_IDE)
+		printf( "ide read %d = %02X\n", addr, r);
+	return r;
+}
+
+static void my_ide_write(uint16_t addr, uint8_t val)
+{
+	if (trace & TRACE_IDE)
+		printf( "ide write %d = %02X\n", addr, val);
+	ide_write8(ide0, addr, val);
+}
+
+struct rtc *rtc;
+
+/*
+ *	Z80 CTC
+ */
+
+struct z80_ctc {
+	uint16_t count;
+	uint16_t reload;
+	uint8_t vector;
+	uint8_t ctrl;
+#define CTC_IRQ		0x80
+#define CTC_COUNTER	0x40
+#define CTC_PRESCALER	0x20
+#define CTC_RISING	0x10
+#define CTC_PULSE	0x08
+#define CTC_TCONST	0x04
+#define CTC_RESET	0x02
+#define CTC_CONTROL	0x01
+	uint8_t irq;		/* Only valid for channel 0, so we know
+				   if we must wait for a RETI before doing
+				   a further interrupt */
+};
+
+#define CTC_STOPPED(c)	(((c)->ctrl & (CTC_TCONST|CTC_RESET)) == (CTC_TCONST|CTC_RESET))
+
+struct z80_ctc ctc[4];
+uint8_t ctc_irqmask;
+
+
+static void PIOA_init(void){
+//init gpio ports
+    int a;
+    for (a=0;a<8;a++){
+       gpio_init(PIOAp[a]);
+       //for dev board
+//       gpio_pull_down(PIOAp[a]);
+    }
+
+}
+
+static uint8_t PIOA_read(void){
+// set as inputs and read
+    int a;
+    uint8_t v=1;
+    uint8_t r=0;
+    //set pullups make input
+    for (a=0;a<8;a++){
+       gpio_set_dir(PIOAp[a],GPIO_IN);
+//       gpio_pull_up(PIOAp[a]);
+    }
+    sleep_us(500);
+    //get bits disable pullups
+    for (a=0;a<8;a++){   
+       if(gpio_get(PIOAp[a]))r=r+v;
+//       gpio_disable_pulls(PIOAp[a]);
+       v=v << 1;
+    }
+    return r;
+
+}
+
+static void PIOA_write(uint8_t val){
+//set as outputs and write
+  int a;
+  uint8_t v=1;
+  for (a=0;a<8;a++){
+    gpio_set_dir(PIOAp[a],GPIO_OUT);
+    gpio_put(PIOAp[a],v & val); 
+    v=v << 1;
+  }
+
+}
+
+#ifdef WithDisplay
+
+//############################################################################################################
+//                                              DISPLAY
+//############################################################################################################
+
+void init_I2C(void){
+    //init i2c
+
+    //SDA
+    gpio_init(I2C_SDA_PIN);
+    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA_PIN);
+    //SCL
+    gpio_init(I2C_SCL_PIN);
+    gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SCL_PIN);
+
+    i2c_init(I2CInst, I2C_BAUDRATE);
+
+}
+
+void init_display(void){
+
+    printf("Display Init\n");
+    SSD1306_init(0x3C,SSD1306_W128xH32);
+
+    SSD1306_background_image(xk_wbw);
+    SSD1306_sendBuffer();
+    DisplayDirty=0;
+}
+
+
+void DisplayLine(uint8_t line){
+   uint8_t linestart[]={0x0,0x40,0x14,0x54};
+//   uint8_t linestart[]={0x0,0x40,0x10,0x50};
+   uint8_t c=0;
+   uint8_t y=line*8; // 8 char deap
+   uint8_t cw=6; // 6char wide
+//   uint8_t lo=line*20; //DDRAM address for each start of line
+   uint8_t lo=linestart[line];
+   uint8_t dw=20; //display width in chars
+   for(c=0;c<dw;c++){
+      SSD1306_drawChar8x8(DisplayDDRAM[c+lo],c*cw,y);
+   }
+//   SSD1306_sendBuffer();
+}
+
+void printBin(unsigned char byte)
+{
+    int i = 8; /* however many bits are in a byte on your platform */
+    while(i--) {
+        putchar('0' + ((byte >> i) & 1)); /* loop through and print the bits */
+    }
+}
+
+void DisplayDDBuffer(){
+    SSD1306_clear();
+    if(DisplayOn==1){
+        DisplayLine(0);
+        DisplayLine(1);
+        DisplayLine(3);
+        DisplayLine(4);
+    }
+    SSD1306_sendBuffer();
+    if (DisplayDirty==2)DisplayDirty=0;
+}
+
+void DisplayWrite(uint8_t val,uint8_t isdata){
+
+    if(isdata==0){
+        //IR
+        if (DisplayDebug)printf("WD ");
+        if (DisplayDebug)printBin(val);
+
+        if (val &0x80){
+           //Set DD Ram Address
+            DisplayAC=val & 0x7f;
+            DisplayACGADD=0;
+            if (DisplayDebug)printf(" DDRAM %i",DisplayAC);
+        }
+        else if (val &0x40){
+            //Set CG Ram Address
+            DisplayAC=val & 0x3f;
+            DisplayACGADD=1;
+            if (DisplayDebug)printf(" CGRAM %i",DisplayAC);
+        }
+        else if (val &0x20){
+            //Function Set
+            //datalength Not applicable
+            if (val &0x8)DisplayLines=2;
+            else DisplayLines=1;
+            if (val &0x4)DisplayFont=1;
+            else DisplayFont=0;
+            if (DisplayDebug)printf(" FS DL8 N%i F%i",DisplayLines,DisplayFont);
+        }
+        else if (val &0x10){
+            //Cursor or display shift
+            if (val &0x8)DisplayShift=1;
+            else DisplayShift=0;
+            if (val &0x4)DisplayRight=1;
+            else DisplayRight=0;
+            if (DisplayDebug)printf(" CDS DS%i DR%i",DisplayShift,DisplayRight);
+        }
+        else if (val &0x08){
+            //Display on/off
+            if (val &0x4){
+                DisplayOn=1;
+//                SSD1306_turnOn();
+                DisplayDirty=1;
+            }else{
+                DisplayOn=0;
+                DisplayDirty=1;
+//                SSD1306_turnOff();
+            }
+            if (val &0x2)DisplayCursorOn=1;
+            else DisplayCursorOn=0;
+            if (val &0x1)DisplayBlinkOn=1;
+            else DisplayBlinkOn=0;
+            if (DisplayDebug)printf(" DOF DO%i DC%i DB%i",DisplayOn,DisplayCursorOn,DisplayBlinkOn);
+        }
+        else if (val &0x04){
+            //Entry Mode Set
+            if (val &0x2)DisplayID=1;
+            else DisplayID=0;
+            if (val &0x1)DisplayShift=1;
+            else DisplayShift=0;
+            if (DisplayDebug)printf(" EMS ID%i S%i",DisplayID,DisplayShift);
+        }
+        else if (val & 0x02){
+            //ReturnHome
+            DisplayAC=0;
+            if (DisplayDebug)printf(" RH");
+        }
+        else if(val & 0x01){
+            //DisplayClear
+            //SSD1306_clear();
+            //SSD1306_sendBuffer();
+            uint8_t c;
+            for(c=0;c<DDRAMMAX;c++)DisplayDDRAM[c]=0;
+            DisplayAC=0;
+            if (DisplayDebug)printf(" CLS");
+            DisplayDirty=1;
+        }
+    }else{
+        //DD write
+        if (DisplayDebug)printf("WR");
+//       printf("DDW %i %i\n",val,DisplayAC);
+        if (DisplayAC<=DDRAMMAX){
+            DisplayDDRAM[DisplayAC]=val;
+            if (DisplayDebug)printf(" %i->[%i] %c",DisplayDDRAM[DisplayAC],DisplayAC,val);
+            DisplayAC++;
+        }else{
+            if (DisplayDebug)printf(" %i->[%i] OOR! %c",val,DisplayAC,val);
+        }
+
+        //DisplayDDBuffer();
+        DisplayDirty=1;
+
+    }
+    if (DisplayDebug)printf("\n");
+}
+
+
+uint8_t  DisplayRead(uint8_t isdata){
+    if (DisplayDebug)printf("DR %i ",isdata);
+    uint8_t r=0;
+    if(isdata==0){
+       //return Busyflag and add counter
+       //Busy flag
+       if (DisplayBusy==1)r=r | 0x80;
+       //Address counter
+       r=r | (DisplayAC & 0x7f);
+       if (DisplayDebug)printf(" R%i\n",r);
+       return r;
+    }else{
+       //DR read
+       if (DisplayACGADD==0){
+          r=DisplayDDRAM[DisplayAC];
+       }else{
+          r=DisplayCGRAM[DisplayAC];
+       }
+       if (DisplayDebug)printf(" %i %i\n",DisplayACGADD,r);
+       return r;
+    }
+    
+    return 0;
+}
+
+#endif
+
+
+static uint8_t io_read_2014(uint16_t addr)
+{
+	if (trace & TRACE_IO)
+		printf( "read %02x\n", addr);
+	if ((addr & 0xFF) == 0xBA) {
+		return 0xCC;
+	}
+
+	addr &= 0xFF;
+
+	if ((addr >= 0xA0 && addr <= 0xA7) && acia && acia_narrow == 1)
+		return acia_read(acia, addr & 1);
+	if ((addr >= 0x80 && addr <= 0x87) && acia && acia_narrow == 2)
+		return acia_read(acia, addr & 1);
+	if ((addr >= 0x80 && addr <= 0xBF) && acia && !acia_narrow)
+		return acia_read(acia, addr & 1);
+	if ((addr >= 0x80 && addr <= 0x87) && sio2 )
+		return sio2_read(addr & 3);
+	if ((addr >= 0x10 && addr <= 0x17) && ide == 1)
+		return my_ide_read(addr & 7);
+	if (addr >= 0xA0 && addr <= 0xA7 && have_16x50)
+		return uart_read(&uart[0], addr & 7);
+	else if (addr == PIOA) return PIOA_read();	
+	else if (addr == SPO256Port)  return SPO256DataReady;
+	else if (addr == SPO256FreqPort) return SPO256FreqPortData; 
+	else if (addr == CTS256Port)  return CTS256DataReady;
+
+	else if (addr == BeepPort) return BeepDataReady;
+        else if (addr >= NeoPixelPort && addr <= NeoPixelPort+7) return GetNeoData(addr-NeoPixelPort);
+#ifdef WithDisplay
+        else if (addr == DisplayRegPort)return DisplayRead(0);
+        else if (addr == DisplayDataPort)return DisplayRead(1);
+#endif
+	if (trace & TRACE_UNK)
+		printf( "Unknown read from port %04X\n", addr);
+	return 0x78;	/* 78 is what my actual board floats at */
+}
+
+static void io_write_2014(uint16_t addr, uint8_t val, uint8_t known)
+{
+	if (trace & TRACE_IO)
+		printf( "write %02x <- %02x\n", addr, val);
+
+	if ((addr & 0xFF) == 0xBA) {
+		/* Quart */
+		return;
+	}
+	addr &= 0xFF;
+	if ((addr >= 0xA0  && addr <= 0xA7) && acia && acia_narrow == 1)
+		acia_write(acia, addr & 1, val);
+	else if ((addr >= 0x80 && addr <= 0x87) && acia && acia_narrow == 2)
+		acia_write(acia, addr & 1, val);
+	else if ((addr >= 0x80 && addr <= 0xBF) && acia && !acia_narrow)
+		acia_write(acia, addr & 1, val);
+	else if ((addr >= 0x80 && addr <= 0x87) && sio2 )
+		sio2_write(addr & 3, val);
+	else if ((addr >= 0x10 && addr <= 0x17) && ide == 1)
+		my_ide_write(addr & 7, val);
+	else if (addr >= 0xA0 && addr <= 0xA7 && have_16x50)
+		uart_write(&uart[0], addr & 7, val);
+	else if ( (addr & 0x7F) >= 0x78 && (addr & 0x7F) <= 0x7C){
+		    uint8_t ad=(addr & 0x7F)-0x78;
+		    pmr[ad]=val; //set page register
+		    if (trace & TRACE_BANK)  printf( "BkReg %02X[%02X]\n", ad,val);
+		}
+	else if (addr == PIOA)PIOA_write(val);	
+	else if (addr == SPO256Port){SPO256DataOut=val;SPO256DataReady=1;}
+	else if (addr == CTS256Port){
+	    if(val>128){
+	        if(val==254){CTS_out=1;printf("Sp On\n");}
+	        if(val==253){CTS_out=0;printf("Sp Off\n");}
+	    }else{
+   	        CTS256DataOut=val;CTS256DataReady=1;
+	    }
+	}
+	else if (addr == BeepPort){BeepDataOut=val;BeepDataReady=1;}
+        else if (addr == SPO256FreqPort){SPO256FreqPortData=val;}
+	else if (addr >= NeoPixelPort && addr<= NeoPixelPort+7){
+		NeoPortAddr = (addr-NeoPixelPort)&7;
+		NeoPortData = val;
+		NeoPortDataReady = 1;
+		}
+#ifdef WithDisplay		
+	else if (addr == DisplayRegPort)DisplayWrite(val,0);
+        else if (addr == DisplayDataPort)DisplayWrite(val,1);
+#endif
+	else if (addr == 0xFD) {
+		trace &= 0xFF00;
+		trace |= val;
+		printf( "trace set to %04X\n", trace);
+	} else if (addr == 0xFE) {
+		trace &= 0xFF;
+		trace |= val << 8;
+		printf("trace set to %d\n", trace);
+	} else if (!known && (trace & TRACE_UNK))
+		printf( "Unknown write to port %04X of %02X\n", addr, val);
+}
+
+
+
+void io_write(int unused, uint16_t addr, uint8_t val){
+    io_write_2014(addr, val, 0);
+}
+
+uint8_t io_read(int unused, uint16_t addr){
+    return io_read_2014(addr);
+}
+
+static void poll_irq_event(void){
+    if (acia)acia_check_irq(acia);
+    uart_check_irq(&uart[0]);
+    if (!sio2_check_im2(sio))sio2_check_im2(sio + 1);
+}
+
+static void reti_event(void){
+    if (sio2) {
+	sio2_reti(sio);
+	sio2_reti(sio + 1);
+    }
+    live_irq = 0;
+    poll_irq_event();
+}
+
+
+void dumpPC(Z80Context* z80ctx){
+    printf("PC %04x\n",z80ctx->PC);
+}
+
+void init_pico_uart(void){
+    // Set up our UART with a basic baud rate.
+    uart_init(UART_ID, 2400);
+
+    // Set the TX and RX pins by using the function select on the GPIO
+    // Set datasheet for more information on function select
+    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+
+    // Actually, we want a different speed
+    // The call will return the actual baud rate selected, which will be as close as
+    // possible to that requested
+    int __unused actual = uart_set_baudrate(UART_ID, BAUD_RATE);
+
+    // Set UART flow control CTS/RTS, we don't want these, so turn them off
+    uart_set_hw_flow(UART_ID, false, false);
+
+    // Set our data format
+    uart_set_format(UART_ID, DATA_BITS, STOP_BITS, PARITY);
+
+    // Turn off FIFO's - we want to do this character by character
+    uart_set_fifo_enabled(UART_ID, false);
+    
+    // And set up and enable the interrupt handlers
+    irq_set_exclusive_handler(UART0_IRQ,intUARTcharwaiting );
+    irq_set_enabled(UART0_IRQ, true);
+    
+    // Now enable the UART to send interrupts - RX only
+    uart_set_irq_enables(UART_ID, true, false);
+
+//    uart_puts(UART_ID, "\nUart INIT OK\n\r");
+}
+
+void setup_led(void){
+    gpio_init(DISKLED);
+    gpio_set_dir(DISKLED, GPIO_OUT);
+
+    gpio_init(AUXLED);
+    gpio_set_dir(AUXLED, GPIO_OUT);
+  
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+}
+
+void flash_led(int t){
+  //flash LED and PCB led
+  gpio_put(DISKLED, 1);
+  gpio_put(PICO_DEFAULT_LED_PIN,1);
+  sleep_ms(t);
+  gpio_put(DISKLED, 0);
+  gpio_put(PICO_DEFAULT_LED_PIN,0);
+  sleep_ms(t);
+}
+
+void PrintToSelected(char * string, int all){
+    int uu=UseUsb;
+    if (all) uu=3;
+    if(uu==0 || uu==3){
+         uart_puts(UART_ID, string);
+    }     
+    if(uu==1 || uu==3){
+         printf("%s",string);
+    }
+}
+
+//************************************************************************************************************
+//*                                    Flash! ...... Ah-ah!                                                  *
+//************************************************************************************************************
+
+int CompareFlashToSDROM(const char * filename){
+    #define COMPSIZE 1024 
+    uint8_t buffer[COMPSIZE];	
+    FIL fil;
+    UINT br;
+    FRESULT fr;
+    uint16_t x;
+    uint8_t e=1;
+    fr = f_open(&fil, filename, FA_READ); //FA_WRITE
+    if (FR_OK != fr && FR_EXIST != fr){
+        panic("\nf_open(%s) error Compare: (%d)\n", filename, fr);
+    }else{
+        fr = f_read(&fil, &buffer, COMPSIZE, &br);
+        for(x=0;x<COMPSIZE;x++){
+             if(buffer[x]!=rom[x])e=0;   
+        }
+    }
+    f_close(&fil);
+    if(e==0)printf("Flash Rom doesn't match %s\n",filename);	
+    return e;
+    
+}
+
+
+uint32_t CksumFlash(uint32_t romsize){
+    uint32_t x;
+    uint32_t c=0;
+    for(x=0;x<romsize;x++)c+=rom[x];
+    return c;
+}
+
+void ReadSdToFlash(FRESULT fr,const char * filename,int readsize){
+    uint32_t fto=FLASH_TARGET_OFFSET;
+    uint8_t buffer[FLASH_SECTOR_SIZE];
+    FIL fil;
+    fr = f_open(&fil, filename, FA_READ); //FA_WRITE
+    if (FR_OK != fr && FR_EXIST != fr){
+        panic("\nf_open(%s) error READ ROM : (%d)\n", filename, fr);
+    }else{
+      int a,b;
+      char c;
+      UINT br;
+      printf("\nWriting to Flash!(Ah-ah) at 0x%x for 0x%x, in 0x%x chunks \n",fto,readsize,FLASH_SECTOR_SIZE);
+      for(a=0;a<readsize;a+=FLASH_SECTOR_SIZE){
+          fr = f_read(&fil, &buffer, FLASH_SECTOR_SIZE, &br);
+          b++;
+          if((b & 0x3)==0){
+              if(b>0x20){
+                  b=0;
+                  printf("|");
+              }else{
+                  printf(".");
+              }
+          }
+          uint32_t ints = save_and_disable_interrupts();
+          flash_range_erase(fto, FLASH_SECTOR_SIZE);
+          flash_range_program(fto, buffer, FLASH_SECTOR_SIZE);
+          restore_interrupts (ints);
+          fto+=FLASH_SECTOR_SIZE;
+      }    
+      printf("\n");
+   }
+   f_close(&fil);
+   
+}
+
+uint32_t ReadRomCsum(void){
+    uint32_t c;
+    FIL fil;
+    FRESULT fr;
+    UINT br;
+    fr = f_open(&fil, "RomCkSum", FA_READ);
+    if (FR_OK != fr && FR_EXIST != fr){
+        printf("Cant open RomCkSum %i\n",fr);
+        f_close(&fil);
+        return 0;
+    }else{
+        fr = f_read(&fil, &c, 4, &br); 
+//        printf("ChkSum on SD %i",c);
+        f_close(&fil);
+        return c;
+    }  
+}
+
+int WriteRomCsum(uint32_t c){
+    FIL fil;
+    FRESULT fr;
+    UINT br;
+    fr = f_open(&fil, "RomCkSum", FA_CREATE_ALWAYS | FA_WRITE);
+    if (FR_OK != fr ){
+        printf("Cant Write to RomCkSum %i\n",fr);
+        f_close(&fil);
+        return 0;
+    }else{  
+        fr = f_write(&fil,&c,4,&br);	
+        f_close(&fil);
+        printf("written CSum %i to SD\n",c);
+        return 1;
+    }   
+
+}
+
+
+
+
+/*
+void ReadSdToRamrom(FRESULT fr,const char * filename,int readsize,int SDoffset,int writetoram ){
+    if(writetoram){
+      printf("\n##### Reading %s from SD %04x to RAM  for %04x bytes #####\n\r",filename,SDoffset,readsize);
+    }else{
+      printf("\n##### Reading %s from SD %04x to ROM  for %04x bytes #####\n\r",filename,SDoffset,readsize);
+    }
+
+    FIL fil;
+    fr = f_open(&fil, filename, FA_READ); //FA_WRITE
+    if (FR_OK != fr && FR_EXIST != fr){
+        panic("\nf_open(%s) error: %s (%d)\n", filename, FRESULT_str(fr), fr);
+    }else{
+      fr = f_lseek(&fil, SDoffset);
+
+      int a;
+      char c;
+      UINT br;
+      for(a=0;a<readsize;a++){
+        fr = f_read(&fil, &c, sizeof c, &br);
+        if (br==0){printf("Read Fail");}
+        if(writetoram){
+          ram[a]=c;
+//        }else{
+//          rom[a]=c; //writing to rom nolonger permitted
+        }
+      }
+
+    }
+    fr = f_close(&fil);
+
+}
+*/
+
+
+void WriteRamToSD(FRESULT fr,const char * filename,int readsize ){
+    char temp[128];
+    sprintf(temp,"\n###### Writing %s to SD from RAM  for %04x bytes#####\n\r",filename,readsize);
+    PrintToSelected(temp,1);
+    FIL fil;
+    fr = f_open(&fil, filename, FA_WRITE | FA_CREATE_ALWAYS); //FA_WRITE
+    if (FR_OK != fr && FR_EXIST != fr){
+        panic("\nf_open(%s) error: (%d)\n", filename, fr);
+    }else{
+
+      int a;
+      char c;
+      UINT bw;
+      for(a=0;a<readsize;a++){
+        //c=ram[a];
+        c= mem_read0(a);
+        fr = f_write(&fil, &c, sizeof c, &bw);
+        if (bw==0){printf("Write Fail");}
+      }
+
+    }
+    fr = f_close(&fil);
+
+}
+
+/*
+void CopyRamRom2Ram(int FromAddr, int ToAddr, int copysize, int fromram, int toram){
+    int a;
+    for(a=0;a<copysize;a++){
+      if(fromram){
+        if(toram){
+          ram[a+ToAddr]=ram[a+FromAddr];
+        }else{
+          ram[a+ToAddr]=rom[a+FromAddr];
+        }
+      }else{
+        if(toram){
+          rom[a+ToAddr]=ram[a+FromAddr];
+        }else{
+          rom[a+ToAddr]=rom[a+FromAddr];
+        }
+      }
+    }
+}
+*/
+
+void DumpRamRom(unsigned int FromAddr, int dumpsize,int dram){
+  int rc=0;
+  int a;
+  if(dram){
+    printf("RAM %04X ",FromAddr);
+  }else{
+    printf("ROM %04X ",FromAddr);
+  }
+  for(a=0;a<dumpsize;a++){
+    if (dram){
+      printf("%02x ",ram[a+FromAddr]);
+    }else{
+      printf("%02x ",rom[a+FromAddr]);
+    }
+      rc++;
+
+      if(rc % 32==0){
+        printf("\nR-M %04x ",rc+FromAddr);
+      }else{
+        if (rc % 8==0){
+          printf(" ");
+        }
+      }
+  }
+
+}
+
+
+void DessembleMemoryUSB(unsigned int FromAddr, int dumpsize){
+   int a=0;
+   char buf[32];
+   while(a<dumpsize){
+       printf( "%04X: ", a+FromAddr);
+       //c=mem_read0(a+FromAddr);
+       nbytes=0;
+       z80_disasm(buf, a+FromAddr);
+       printf("%s\n\r",buf);
+       a=a+nbytes;
+   }
+
+}
+
+
+//dumpmemory to USB for serial dump command
+void DumpMemoryUSB(unsigned int FromAddr, int dumpsize){
+    printf("\nDUMP MEMORY\n");
+    int rc=0;
+    int a;
+    const unsigned char width=16;
+    unsigned char c;
+    char string[width+1];
+    string[width]=0;
+    printf("%04X ",FromAddr);
+    for(a=0;a<dumpsize;a++){
+       c=mem_read0(a+FromAddr);
+       printf("%02x ",c);
+       string[rc % width]='.';
+       if ((c>=' ') && (c<='~')) string[rc % width ]=c;
+       rc++;
+       if(rc % width==0){
+           printf(" %s ",string);
+           printf("\r\n%04X ",rc+FromAddr);
+       }else{
+           if (rc % 8==0){
+              printf(" ");
+           }
+       }
+    }
+
+}
+
+
+// dump memory image to console and sd if fr is set
+void DumpMemory(unsigned int FromAddr, int dumpsize,FRESULT fr){
+  printf("\nDUMP MEMORY ROM\n");
+  int rc=0;
+  int a;
+  char temp[128];
+  
+  sprintf(temp,"MEM %04X ",FromAddr);
+  PrintToSelected(temp,0);
+  if (fr!=0) WriteRamToSD(fr,"DUMP.BIN",0x10000 );
+  for(a=0;a<dumpsize;a++){
+      sprintf(temp,"%02x ",mem_read0(a+FromAddr));
+      PrintToSelected(temp,0);
+      rc++;
+
+      if(rc % 32==0){
+        sprintf(temp,"\r\nMEM %04x ",rc+FromAddr);
+        PrintToSelected(temp,0);
+      }else{
+        if (rc % 8==0){
+          sprintf(temp," ");
+          PrintToSelected(temp,0);
+        }
+      }
+  }
+
+}
+
+
+// dump memory image to console and sd if fr is set
+void DumpFlashRom(unsigned int FromAddr, int dumpsize,FRESULT fr){
+  printf("\nDUMP FLASH (Ah-ar!) ROM\n");
+  int rc=0;
+  int a;
+  char temp[128];
+  
+  sprintf(temp,"MEM %04X ",FromAddr);
+  PrintToSelected(temp,0);
+  if (fr!=0) WriteRamToSD(fr,"DUMP.BIN",0x10000 );
+  for(a=0;a<dumpsize;a++){
+      sprintf(temp,"%02x ",rom[a]);
+      PrintToSelected(temp,0);
+      rc++;
+
+      if(rc % 32==0){
+        sprintf(temp,"\r\nMEM %04x ",rc+FromAddr);
+        PrintToSelected(temp,0);
+      }else{
+        if (rc % 8==0){
+          sprintf(temp," ");
+          PrintToSelected(temp,0);
+        }
+      }
+  }
+}
+
+int GetSwitches(){
+//serial port selection swithch
+    gpio_init(SERSEL);
+    gpio_set_dir(SERSEL,GPIO_IN);
+    gpio_pull_up(SERSEL);
+
+    sleep_ms(1); //wait for io to settle.
+
+    int v=0;
+    if (gpio_get(SERSEL)==1){
+        UseUsb=1;
+    }else{
+        UseUsb=0;
+    }
+
+//and buttons and an LED too.
+
+//setup DUMP gpio
+    gpio_init(DUMPBUT);
+    gpio_set_dir(DUMPBUT,GPIO_IN);
+    gpio_pull_up(DUMPBUT);
+
+//setup RESETBUT gpio
+    gpio_init(RESETBUT);
+    gpio_set_dir(RESETBUT,GPIO_IN);
+    gpio_pull_up(RESETBUT);
+
+//setup AUXBUT gpio
+    gpio_init(AUXBUT);
+    gpio_set_dir(AUXBUT,GPIO_IN);
+    gpio_pull_up(AUXBUT);
+
+    return 0;
+}
+
+int SDFileExists(char * filename){
+    FRESULT fr;
+    FILINFO fno;
+
+    fr = f_stat(filename, &fno);
+    return fr==FR_OK;
+}
+
+
+//############################################################################################################
+//################################################# Sound ####################################################
+//############################################################################################################
+
+void PlayAllophone(int al){
+    int b,s;
+    uint8_t v;
+    int pwmr=MidiNoteWrap[SPO256FreqPortData & 0x7f]/4;
+
+    if (al==64){al=0;}
+
+    //reset pwm settings (play notes may change them)
+    pwm_set_clkdiv(PWMslice,16);
+    pwm_set_wrap (PWMslice, 256);
+    
+    if(al>MAXALLOPHONE) al=0;
+    
+    //get length of allophone sound bite
+    s=allophonesizeCorrected[al];
+    //and play
+    for(b=0;b<s;b++){
+        v=allophoneindex[al][b]; //get delta value
+        sleep_us(pwmr);
+        pwm_set_both_levels(PWMslice,v,v);
+
+    }
+
+}
+
+//play disk sounds in 1/2 second chunks from a loop
+void PlayDiskSounds(void){
+   gpio_put(DISKLED,1);	
+   uint8_t c=floppy_disc_short[disksound_pointer];
+   disksound_pointer++;
+   if(disksound_pointer>FLOPPYDISKSOUNDLEN)disksound_pointer=0;
+   pwm_set_both_levels(PWMslice,c,c);
+   sleep_us(110); //8khz ish
+   disksound_timer++;
+   if(disksound_timer>4000){
+       playing_disk=0;
+       gpio_put(DISKLED,0);
+       disksound_timer=0;
+   }
+}
+
+void PlayAllophones(uint8_t *alist,int listlength){
+   int a;
+   for(a=0;a<listlength;a++){
+     PlayAllophone(alist[a]);
+   }
+}
+
+void SetPWM(void){
+    gpio_init(soundIO1);
+    gpio_set_dir(soundIO1,GPIO_OUT);
+    gpio_set_function(soundIO1, GPIO_FUNC_PWM);
+
+    gpio_init(soundIO2);
+    gpio_set_dir(soundIO2,GPIO_OUT);
+    gpio_set_function(soundIO2, GPIO_FUNC_PWM);
+
+    PWMslice=pwm_gpio_to_slice_num (soundIO1);
+    pwm_set_clkdiv(PWMslice,16);
+    pwm_set_both_levels(PWMslice,0x80,0x80);
+
+    pwm_set_output_polarity(PWMslice,true,false);
+
+    pwm_set_wrap (PWMslice, 256);
+    pwm_set_enabled(PWMslice,true);
+
+}
+
+void Beep(uint8_t note){
+    int w;     
+    //set frequency    
+    pwm_set_clkdiv(PWMslice,256);
+    if (note>0 && note<128){
+      //get divisor from Midi note table.
+      w=MidiNoteWrap[note];  
+      pwm_set_both_levels(PWMslice,w>>1,w>>1);
+      //set frequency from midi note table.
+      pwm_set_wrap(PWMslice,w);
+    }else{
+      pwm_set_both_levels(PWMslice,0x0,0x0);  
+    }
+}
+
+//############################################################################################################
+//######################## NEO PIXEL DRIVER ######################################
+//############################################################################################################
+
+//neo vars
+
+uint8_t neoaddr;
+uint8_t neored;
+uint8_t neogreen;
+uint8_t neoblue;
+uint8_t neodata;
+uint8_t neorepeat;
+uint8_t neobrightness=255;
+uint8_t neomode; // 0 normal, 1 pallette
+uint8_t neomax=NUM_PIXELS;
+
+static inline void put_pixel(uint32_t pixel_grb) {
+    pio_sm_put_blocking(pio0, 0, pixel_grb << 8u);
+}
+
+static inline uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
+    return ((uint32_t)(r) << 8) |
+           ((uint32_t)(g) << 16) |
+           (uint32_t)(b);
+}
+
+static inline uint8_t value_bright(uint8_t value, uint8_t bright){
+    return value*bright>>8;
+}
+
+void set_pixel_value(uint8_t pixel,uint8_t r, uint8_t g, uint8_t b){
+    pixels[pixel][0]=r;
+    pixels[pixel][1]=g;
+    pixels[pixel][2]=b;
+} 
+
+void set_pixel_pallette(uint8_t pixel,uint8_t pallette){
+    set_pixel_value(pixel,pixelspallette[pallette][0],pixelspallette[pallette][1],pixelspallette[pallette][2]);
+}
+
+void send_pixels(void){
+    int p;
+    uint32_t data[NUM_PIXELS];
+    if(neobrightness<255){
+        for (p=0;p<neomax;p++){
+            data[p]=(urgb_u32(value_bright(pixels[p][0],neobrightness),
+                          value_bright(pixels[p][1],neobrightness),
+                          value_bright(pixels[p][2],neobrightness)
+                          )<<8u);
+        }
+    }else{
+        for (p=0;p<neomax;p++){
+            data[p]=(urgb_u32(pixels[p][0],pixels[p][1],pixels[p][2])<<8u);
+        }
+    }
+  
+    for (p=0;p<neomax;p++){
+        pio_sm_put_blocking(pio0, 0, data[p]);
+    }
+}
+
+void SetAllPixels(uint8_t red,uint8_t green,uint8_t blue){
+    for (int i = 0; i <= neomax; i++) {
+        put_pixel(urgb_u32(red, green, blue));  // Black or off
+    }
+
+}
+
+void init_neo(void){
+
+    PIO pio = pio0;
+    int sm = 0;
+    uint offset = pio_add_program(pio, &ws2812_program);
+
+    ws2812_program_init(pio, sm, offset, PIXEL_PIN, 800000, RGBW);
+
+    send_pixels();
+}
+
+void neoinfo(void){
+    printf("\n\rNeoInfo\n\r");
+    printf("Mode: %X \n\r",neomode);
+    printf("Brightness %X\n\r",neobrightness);
+    printf("Pallette\n\r");
+    printf(" R  G  B \n\r");
+    for(int a=0;a<128;a++){
+        printf(" %02X %02X %02X \n\r",pixelspallette[a][0],pixelspallette[a][1],pixelspallette[a][2]);   
+    }
+    printf("\n\r");
+}
+
+uint8_t GetNeoData(uint8_t addr){
+   switch (addr){
+     case 0:
+       return neodata;
+       break;
+     case 1:
+       break;
+     case 2:
+       break;
+     case 3:       
+       break;
+     case 4:
+       break;
+     case 5:
+       return neored;
+       break;
+     case 6:
+       return neogreen;
+       break;
+     case 7:
+       return neoblue;
+       break;
+   }    
+}
+
+void DoNeoCmd(uint8_t data){
+   switch (data){
+     case 1:
+       neomode=0;
+       break;
+     case 2:
+       neomode=1;
+       break;
+     case 3:
+       neorepeat=neodata;
+       break;
+     case 4:
+       neobrightness=neodata;
+       send_pixels();
+       break;
+     case 5:
+       neomax=neodata;
+       if (neomax>NUM_PIXELS) neomax=NUM_PIXELS;	  
+       break;
+     case 10:
+       neoinfo();
+       break;	
+     case 14:
+       SetAllPixels(neored,neogreen,neoblue);       
+       break;
+     case 15:
+       SetAllPixels(0,0,0);
+       break;
+   }             	    
+     
+}
+
+void DoNeo(uint8_t addr,uint8_t data){
+//   printf("Do Neo %i %i \n\r",addr,data);
+   switch (addr){
+     case 0:
+       neodata=data;
+       break;
+     case 1:
+       DoNeoCmd(data);
+       break;
+     case 2:
+       break;
+     case 3:
+       if (neomode==0) set_pixel_value(data,neored,neogreen,neoblue);
+       if (neomode==1) set_pixel_pallette(data,neodata);
+       if (neorepeat>0){
+           for (int p=neorepeat;p<neomax;p++){
+               pixels[p][0]=pixels[p-neorepeat][0];
+               pixels[p][1]=pixels[p-neorepeat][1];
+               pixels[p][2]=pixels[p-neorepeat][2];
+           }
+       }    
+       send_pixels();
+       break;
+     case 4:
+       pixelspallette[data][0]=neored;
+       pixelspallette[data][1]=neogreen;
+       pixelspallette[data][2]=neoblue;
+       break;
+     case 5:
+       neored=data;
+       break;
+     case 6:
+       neogreen=data;
+       break;
+     case 7:
+       neoblue=data;
+       break;
+  }
+}
+
+
+//#################################################################################################
+//########################################## SPEACH ###############################################
+//#################################################################################################
+
+/*
+  Source		Method				Dest
+  ------                ------                          ----
+  Allophone Port 	AllophoneIn		    	Allophone Buffer
+  Sentance Port		AddToSentance -> Allophone in	Allophone Buffer
+  Fork RS232 out	AddToSentance -> Allophone in	Allophone Buffer
+  Allophone Buffer	AllophoneOut -> PlayAllophone	Sound
+*/
+
+/*
+void test_say(char * Sentance){
+    uint16_t x=0;
+    char c;
+    while((c=Sentance[x])!=0){
+        printf("%c",c);
+        x++;
+    }
+    printf("\n");
+}
+*/
+
+//send allophone from curcular buffer
+//to PlayAllophone
+void AllophoneOut(){
+    if(allophoneIn!=allophoneOut){
+        char c =AlloBuffer[allophoneOut];
+        allophoneOut++;
+        if(allophoneOut>ALLOBUFFERMAX)allophoneOut=0;
+        PlayAllophone(c);
+    }
+}
+
+//Add allophone as char, to Circular buffer
+//
+void AllophoneIn(char c){
+    AlloBuffer[allophoneIn]=c;
+    allophoneIn++;
+    if(allophoneIn>ALLOBUFFERMAX)allophoneIn=0;
+}
+
+//add char to CTS Sentance
+//calls sayWBW on '/n' Passes Allophones to Circular buffer 
+void AddToSentance(char c){
+    if(c=='\n'){
+//        test_say(Sentance);
+//	printf("\nSay '%s'\n",Sentance);
+	//add spaces to end of sentance#
+        uint16_t s=slen(Sentance);
+        Sentance[s++]=' ';
+        Sentance[s++]=' ';
+        Sentance[s++]=' ';
+        Sentance[s]=0;
+        sayWBW(Sentance); //convert to allophones in output[]
+//        PrintOutput();
+//        printf(" - after say , starting speak\n");
+        //add output allophones
+        uint16_t x=0;
+        while(x<ALLOBUFFERMAX && AlloBuffer[x]!=0){
+            AllophoneIn(AlloBuffer[x]);
+            x++;
+//            printf("A:%i ",AlloBuffer[x]);
+        }
+        AlloBuffer[0]=0;
+        SentPos=1;
+        Sentance[0]=' ';
+        Sentance[SentPos]=0;
+    }else{
+        Sentance[SentPos]=c;
+        
+        SentPos++;
+        //truncate if full
+        if(SentPos>SENTANCEMAX-5){SentPos=SENTANCEMAX-5;}
+        Sentance[SentPos]=0;
+    }
+}
+
+
+//############################################################################################################
+//################################################# Core 1 ###################################################
+//############################################################################################################
+
+void Core1Main(void){
+
+  printf("\n#Core 1 Starting#\n");
+
+// init sound
+    SetPWM();
+  
+//init neopixels
+    init_neo();
+
+//OK
+    uint8_t alist[] ={OW1,PA3,KK1,EH1,EY1,0};
+
+    PlayAllophones(alist,sizeof(alist));
+    sleep_ms(500);
+
+    while(1){
+      //Send raw Allophone data
+        if(SPO256DataReady>0){
+            SPO256DataReady=0;
+	    AllophoneIn(SPO256DataOut);
+        }
+      
+      //Send beep frequencies
+        if(BeepDataReady>0){
+            Beep(BeepDataOut);
+            BeepDataReady=0;
+        }
+          
+      //Send data for Neo Pixels
+        if(NeoPortDataReady>0){
+            DoNeo(NeoPortAddr,NeoPortData);
+            NeoPortDataReady=0;
+        }
+
+      //Playdisk sounds triggered from sd card LED 
+        if(playing_disk){
+            PlayDiskSounds();
+        }
+      
+      //Data to Sentance to be encoded to allophones
+        if(CTS256DataReady>0){
+          // add to sentance buffer
+            AddToSentance(CTS256DataOut);
+            CTS256DataReady=0;
+        }
+/*      
+      //If speak is triggered after a sentance encoded to allophones
+      if(allophoneIn>0){
+         if(AlloBuffer[allophoneOut]==0){
+            allophoneIn=0;
+            allophoneOut=0;
+            AlloBuffer[0]=0;
+//            printf("\nSpeak Ended\n");
+         }else{   
+            char c =AlloBuffer[allophoneOut];
+            if (c==64){c=0;}
+            PlayAllophone(c);
+
+            allophoneOut++;
+         }   
+      }
+*/
+
+   //process allophone buffer 
+       AllophoneOut();	
+	      
+#ifdef WithDisplay
+       if(DisplayDirty){
+           DisplayDirty=2;
+           DisplayDDBuffer();
+       }
+#endif
+
+       tight_loop_contents();
+  }
+}
+
+
+
+//#######################################################################################################
+//#                                      MAIN                                                           #
+//#######################################################################################################
+
+
+
+void main(void)
+{
+	static struct timespec tc;
+		
+	int opt;
+	int fd;
+	int romen = 1;
+	
+	const char * idepathi ="";
+	const char * idepath ="";
+	const char * idepath1 ="";
+	
+	int indev;
+	char *patha = NULL, *pathb = NULL;
+	const char * romfile ="XXXXXXXXXX.BIN"; //default ROM image
+        uint32_t romsize = 0x80000; //512 K
+        char temp[250];
+	
+	int SerialType =0; //ACIA=0 SIO=1
+
+        char RomTitle[200];
+
+        
+//over clock done in ini parcer now
+        set_sys_clock_khz(250000, true);
+
+#define INDEV_ACIA	1
+#define INDEV_SIO	2
+#define INDEV_CPLD	3
+#define INDEV_16C550A	4
+#define INDEV_KIO	5
+
+// led gpio
+        setup_led();
+        flash_led(250);
+        stdio_usb_init();
+        flash_led(250);
+        printf("\n %c[2J\n\n\rUSB INIT OK \n\r",27);
+           
+#ifdef WithDisplay
+// init display
+        init_I2C();
+        printf(" Done\n ");
+        init_display();
+        printf("\nDone\n");
+#endif           
+           
+                
+//init uart
+        init_pico_uart();
+        sprintf(RomTitle,"\n %c[2J \n\n\rUART INIT OK \n\r",27);
+        uart_puts(UART_ID,RomTitle);
+
+// mount SD Card        
+        FATFS fs;
+        FRESULT fr = f_mount(&fs, "", 1);
+        
+        if (FR_OK != fr){
+            // panic("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
+            sleep_ms(3000); // wait for USB
+            gpio_put(DISKLED, 1); // SET LED PIN ON as a subtle hint.
+            printf("SD INIT FAIL  \n\r");
+            uart_puts(UART_ID, "SD INIT FAIL\n\r");
+#ifdef WithDisplay            
+            SSD1306_background_image(NoDisk);
+            SSD1306_sendBuffer();
+            DisplayDirty=0;
+#endif 
+            sleep_ms(1000);
+            while(1){
+               flash_led(250);
+            }; //halt
+        }
+	printf("SD INIT OK  \n\r");
+        uart_puts(UART_ID, "SD INIT OK \n\r");
+        
+// inifile parse
+	dictionary * ini ;
+	char       * ini_name ;
+        const char  *   s ;
+        const char * inidesc;
+                
+        int overclock;
+        int jpc;
+        int iscf=0;
+
+       	ini_name = "rc2040.ini";
+	
+	if (SDFileExists(ini_name)){
+	  sprintf(temp,"Ini file %s Exists Loading ... \n\r",ini_name);
+	  PrintToSelected(temp,1);
+
+//########################################### INI Parser ######################################		
+	  ini = iniparser_load(fr, ini_name);
+	  //iniparser_dump(ini, stdout);
+	  
+	  //override Jumpers
+          overridejumpers=iniparser_getint(ini, "ROM:ovjump", 0);
+
+	  // ROMfile from ini
+	  romfile = iniparser_getstring(ini, "ROM:romfile", romfile);
+	  romsize = iniparser_getint(ini, "ROM:romsize", 0x2000);
+
+	  // start at
+	  jpc = iniparser_getint(ini, "ROM:jumpto", 0);
+
+          // Use Ide
+	  ide = iniparser_getint(ini, "IDE:ide",1);
+	  
+	  // IDE cf file
+	  iscf = iniparser_getint(ini, "IDE:iscf", iscf);
+	  
+	  idepathi = iniparser_getstring(ini, "IDE:idefilei", "");
+	  idepath = iniparser_getstring(ini, "IDE:idefile", idepath);
+	  idepath1 = iniparser_getstring(ini, "IDE:idefile1", "");
+	  
+	  // USB or UART
+	  UseUsb = iniparser_getint(ini, "CONSOLE:port", UseUsb);
+
+	  // ACIA /SERIAL
+          SerialType = iniparser_getint(ini, "EMULATION:serialtype",0 );
+          
+          // ININAME
+          inidesc = iniparser_getstring(ini, "EMULATION:inidesc","Default ini" );
+          sprintf(temp,"INI Description: %s \n\r",inidesc,1);
+          PrintToSelected(temp,1);
+
+          // Trace enable from inifile
+	  trace = iniparser_getint(ini, "DEBUG:trace",0 );
+	  watch = iniparser_getint(ini, "DEBUG:watch",0 );
+
+	  // PORT
+	  PIOA = iniparser_getint(ini, "PORT:pioa",0 );
+
+	  SPO256Port = iniparser_getint(ini, "PORT:spo256",SPO256Port );
+	  SPO256FreqPort = iniparser_getint(ini, "PORT:spo256freq",SPO256FreqPort );
+	  CTS256Port = iniparser_getint(ini, "PORT:cts256",CTS256Port );
+	  BeepPort = iniparser_getint(ini, "PORT:beep",BeepPort );
+	  NeoPixelPort = iniparser_getint(ini,"PORT:Neo", NeoPixelPort);
+#ifdef WithDisplay
+          DisplayRegPort = iniparser_getint(ini,"PORT:DisplayReg",DisplayRegPort);
+          DisplayDataPort= iniparser_getint(ini,"PORT:DisplayData",DisplayDataPort);
+#endif
+
+          // Overclock
+	  overclock = iniparser_getint(ini, "SPEED:overclock",0 );
+	  if (overclock>0){
+	        sprintf(temp,"Overclock to %i000\n\r",overclock,1);
+	        PrintToSelected(temp,1);
+	  	set_sys_clock_khz(overclock*1000, true);
+          }
+
+	  //iniparser_freedict(ini); // cant free, settings are pointed to dictionary.
+
+	  PrintToSelected("Loaded INI\n\r",1);	
+
+//########################################### End of INI Parser ###########################
+
+//Get switches and select UART from switches
+        GetSwitches();	
+	
+        }else{
+            uart_puts(UART_ID,"No  \n\r");
+            printf("SD INIT OK \n\r",1);
+        }
+        
+        flash_led(200);
+        if (UseUsb==1){
+            PrintToSelected("\rWaiting for USB to connect\n\r",1);
+            //if usb wait for usb to connect.
+            for (int a=0;a<30;a++){
+               if (tud_cdc_connected())break;
+               sleep_ms(100);
+            }
+            //while (!tud_cdc_connected()) { sleep_ms(100);  }
+        }
+
+        if(UseUsb==3){
+           printf("##ABORT##  Serial default NOT selected\n");
+           while(1);
+        }else{
+            if(UseUsb==1){   
+    	        printf("Default Serial USB\n"); 
+    	    }else{
+	        printf("Default Serial UART\n");
+	    }
+       }
+
+//compiled time
+	printf("\n\rCompiled %s %s\n",__DATE__,__TIME__);
+
+// Output Decided on serial port so from here on Print only to that post
+
+//init PIO
+        if(PIOA<256) PIOA_init();
+
+//chip detect
+     char chip[8]="??????";
+#ifdef PICO_RP2350
+     sprintf(chip,"RP2350");
+#endif
+#ifdef PICO_RP2040
+     sprintf(chip,"RP2040");
+#endif
+
+//banner
+sprintf(RomTitle, "\n\r\n\r");PrintToSelected(RomTitle,0);                                        
+sprintf(RomTitle, "\n\r     _____    _     ____     ____   ");PrintToSelected(RomTitle,0);                       
+sprintf(RomTitle, "\n\r    |  __ \\  | |   / __ \\   / __ \\  ");PrintToSelected(RomTitle,0);                         
+sprintf(RomTitle, "\n\r    | |__| | | |  | |  |_| | |  | | ");PrintToSelected(RomTitle,0);                       
+sprintf(RomTitle, "\n\r    |  ___/  | |  | |   _  | |  | | ");PrintToSelected(RomTitle,0);                        
+sprintf(RomTitle, "\n\r    | |      | |  | |__| | | |__| | ");PrintToSelected(RomTitle,0);                       
+sprintf(RomTitle, "\n\r    |_|      |_|   \\____/   \\____/  ");PrintToSelected(RomTitle,0);    
+sprintf(RomTitle, "\n\r     _       _   _____   _       _    ");PrintToSelected(RomTitle,0);                       
+sprintf(RomTitle, "\n\r    | |     | | (___  \\ | |     | |   ");PrintToSelected(RomTitle,0);                         
+sprintf(RomTitle, "\n\r    | |  _  | |  ___| | | |  _  | |   ");PrintToSelected(RomTitle,0);                       
+sprintf(RomTitle, "\n\r    | | | | | | (___ (  | | | | | |   ");PrintToSelected(RomTitle,0);                        
+sprintf(RomTitle, "\n\r    | | | | | |  ___| | | | | | | |   ");PrintToSelected(RomTitle,0);                       
+sprintf(RomTitle, "\n\r    |_| |_| |_| (_____/ |_| |_| |_|   ");PrintToSelected(RomTitle,0);                            
+sprintf(RomTitle, "\n\r    ");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r   ___________________________________ ");PrintToSelected(RomTitle,0);
+#ifdef WithDisplay
+sprintf(RomTitle, "\n\r  |        _________________          |");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r  |       | RomWBW          |         |");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r  |       | Ready           |         |");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r  |       |_________________|         |");PrintToSelected(RomTitle,0);
+#endif
+sprintf(RomTitle, "\n\r  |  __    __    __      __           |");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r  | |__|  |__|  |__|    |__|          |");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r  |                                   |");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r  |        PICO ROMWBW on %s      |",chip);PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r  |         Derek Woodroffe           |");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r  |           Extreme Kits            |");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r  |     Kits at extkits.uk/ROMWBW     |");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r  |  _______      2026                |");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r  | |_______|        eXtkits    WBW   |");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r _|___________________________________|_");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r|_______________________________________| \n\r\n\r");PrintToSelected(RomTitle,0);
+sprintf(RomTitle, "\n\r    ");PrintToSelected(RomTitle,0);                                                                              
+
+// memory free
+	printf("Total Heap %i\n",getTotalHeap());
+	printf("Free Heap %i\n",getFreeHeap());
+
+//init Emulation
+	fast = 1;
+
+	if (SerialType==0){
+  	    //ACIA enable 
+  	  
+  	    //SIO
+	    sio2 = 0;
+	    sio2_input = 0;
+	    //ACIA
+	    have_acia = 1;
+	    indev = INDEV_ACIA;
+            acia_narrow = 0;
+            PrintToSelected("\rACIA selected\n\r",1);
+        }else{
+            //SIO enable 
+          
+            //SIO
+            sio2 = 1;
+            sio2_input = 1;
+            indev = INDEV_SIO;
+            //ACIA
+            have_acia = 0;
+            acia_narrow = 0;
+            PrintToSelected("\rSIO selected\n\r",1);
+        }
+        
+        sprintf(RomTitle,"\nCPM/IDE 0 File:'%s' '%s' \n\r",idepath,idepathi);
+        PrintToSelected(RomTitle,1);
+
+        if(strlen(idepath1)>3){
+            sprintf(RomTitle,"CPM/IDE 1 File:'%s' '%s' \n\r",idepath1,idepathi);
+            PrintToSelected(RomTitle,1);
+        }
+        
+        
+        extern char __flash_binary_start;  // defined in linker script
+        extern char __flash_binary_end;    // defined in linker script
+        uintptr_t start = (uintptr_t) &__flash_binary_start;
+        uintptr_t end = (uintptr_t) &__flash_binary_end;
+        printf( "\nBinary starts at %08x and ends at %08x, size is %08x\n", start, end, end-start);
+
+        sprintf(RomTitle,"Checking: '%s' against FLASH! (Ahrrrr)\n\r",romfile);
+        PrintToSelected(RomTitle,1);
+        
+// copmare flash rom with cksum on flash, and compare first 1k of romfile with flash
+// reload flash is mismatch
+        uint32_t c;
+        if ((CksumFlash(romsize)!=ReadRomCsum()) || CompareFlashToSDROM(romfile)==0){
+            printf("ROM doesn't match %s on SD reloading ROM\n",romfile);	
+            sprintf(RomTitle,"Loading: '%s' for 0x%X bytes from FLASH! (Ahrrrr)\n\r",romfile,romsize);
+	    ReadSdToFlash(fr,romfile,romsize); //load directly to flash
+	    c=CksumFlash(romsize);
+	    WriteRomCsum(c);
+        }
+
+        have_ctc = 0;
+        have_16x50 = 0;
+
+  	if (ide == 1 ) {
+		ide0 = ide_allocate("cf");
+		if (ide0) {
+			if (iscf==0){
+                          FRESULT ide_fri=f_open(&fili, idepathi, FA_READ | FA_WRITE);
+                          if (ide_fri != FR_OK) {
+                              printf("Error IDE ident file Open Fail %s ",idepathi);
+                              ide = 0;
+                              if (trace & TRACE_IDE) printf( "IDE0 ident file Open fail");
+                          }    
+                        }
+                        FRESULT ide_frd=f_open(&fild, idepath, FA_READ | FA_WRITE);
+                        if ( ide_frd != FR_OK) {
+				printf("Error IDE Data Open Fail %s ",idepath);
+				ide = 0;
+				if (trace & TRACE_IDE) printf( "IDE0 Data Open fail");
+			}
+			if (ide_attach(ide0, 0, fili,fild,iscf) == 0) {
+				ide = 1;
+				ide_reset_begin(ide0);
+				if (trace & TRACE_IDE) printf( "IDE0 Open OK");
+			}
+					
+			if(strlen(idepath1)>4){ 
+                            FRESULT ide_frd=f_open(&fild1, idepath1, FA_READ | FA_WRITE);
+                            if (ide_attach(ide0, 1, fili,fild1,iscf) == 0) {
+                                ide_reset_begin(ide0);
+                                printf( "IDE1 %s Open OK\n\r",idepath1);
+                            }else{
+                            	ide=0;
+			    }
+			}  
+
+		}
+        }
+
+	if (have_acia) {
+		acia = acia_create();
+		if (trace & TRACE_ACIA)
+			acia_trace(acia, 1);
+	}
+	if (sio2)
+		sio_reset();
+	if (have_16x50)
+		uarta_init(&uart[0], indev == INDEV_16C550A ? 1: 0);
+	switch(indev) {
+	case INDEV_ACIA:
+		acia_set_input(acia, 1);
+		break;
+	case INDEV_SIO:
+		sio2_input = 1;
+		break;
+	case INDEV_CPLD:
+		break;
+	case INDEV_16C550A:
+		break;
+	default:
+		printf( "Invalid input device %d.\n", indev);
+	}
+        
+//Init Z80
+	tc.tv_sec = 0;
+	tc.tv_nsec = 20000000L;
+
+	Z80RESET(&cpu_z80);
+	//nonstandard start vector
+	if(jpc){
+	    cpu_z80.PC=jpc;
+            sprintf(temp,"Starting at 0x%04X \n\r",jpc);
+            PrintToSelected(temp,1);
+	}
+	
+	cpu_z80.ioRead = io_read;
+	cpu_z80.ioWrite = io_write;
+	cpu_z80.memRead = mem_read;
+	cpu_z80.memWrite = mem_write;
+	cpu_z80.trace = z80_trace;
+
+
+	PrintToSelected("\r\n #######  Pico RomWBW STARTING  ######\n\r",0);
+
+//Start Core1
+        multicore_launch_core1(Core1Main);
+//        printf("\n#Core 1 Started#\n\n");
+
+	/* This is the wrong way to do it but it's easier for the moment. We
+	   should track how much real time has occurred and try to keep cycle
+	   matched with that. The scheme here works fine except when the host
+	   is loaded though */
+
+	/* We run 7372000 t-states per second */
+	/* We run 365 cycles per I/O check, do that 50 times then poll the
+	   slow stuff*/
+	while (!emulator_done) {
+		int i;
+		/* 36400 T states for base RC2014 - varies for others */
+
+		// was i40 j50
+		for (i = 0; i < 40; i++) {  
+		    int j;
+		    //IoTimeShare 200 better for speed. 50 better for IO
+		    for (j = 0; j < IoTimeShare; j++) { Z80ExecuteTStates(&cpu_z80, (tstate_steps + 5)/ 10);	}
+
+		    if (acia) acia_timer(acia);
+		    if (sio2) sio2_timer();
+		    if (have_16x50) uart_event(&uart[0]);
+		}
+		
+		//fake USB char in interrupts
+		intUSBcharwaiting();
+		
+		if (int_recalc) {
+			/* If there is no pending Z80 vector IRQ but we think
+			   there now might be one we use the same logic as for
+			   reti */
+			if (!live_irq )	poll_irq_event();
+			/* Clear this after because reti_event may set the
+			   flags to indicate there is more happening. We will
+			   pick up the next state changes on the reti if so */
+			if (!(cpu_z80.IFF1|cpu_z80.IFF2)) int_recalc = 0;
+		}
+				
+	            if(gpio_get(DUMPBUT)==0){
+                        DumpMemory(0,0x10000,fr);
+                        while(gpio_get(DUMPBUT)==0);
+                    }
+
+                    if(gpio_get(RESETBUT)==0) {
+                        PrintToSelected("\r\n ########################### \n\r",0);
+                        PrintToSelected(" ####### Z80 RESET ######### \n\r",0);
+                        PrintToSelected(" ########################### \n\n\r",0);
+			z80_vardump();                        
+                        Z80RESET(&cpu_z80);
+                        while(gpio_get(RESETBUT)==0);
+                    }
+                    if(gpio_get(AUXBUT)==0){
+                       gpio_put(AUXLED,1);                       
+                       while(gpio_get(AUXBUT)==0);
+                       sleep_ms(100);
+#ifdef FFS_ENABLE                    
+                       serialfile();
+#endif                    
+#ifndef FFS_ENABLE
+  		      PrintToSelected("\r\n #######  Sorry FFS not compiled in  ######\n\r",0);
+#endif
+                       gpio_put(AUXLED,0);
+                    
+                    }
+	}
+}
+
+

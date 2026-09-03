@@ -7,11 +7,11 @@
 //define to run tests on the rule set
 //#define test 1
 
-//define for WBW
-//#define WBW 0
+//define for inclusion to pico RomWBW
+#define WBW 0
 
 //set to 1 to provide default debug output.
-#define DEBUG 1
+#define DEBUG 0
 
 #ifdef test
   //debug level if in test
@@ -21,12 +21,13 @@
 //base rulez and exceptions
 #include "rules_array.c"
 
-#define maxallophones 4096
+//#define maxallophones 4096
 
 //debug indent
 uint8_t indent=0;
 //buffer for allophones
-char output[4096]="";
+#define ALLOBUFFERMAX 4096
+char AlloBuffer[ALLOBUFFERMAX]="";
 
 uint8_t debug=DEBUG;
 
@@ -586,36 +587,36 @@ void CreateTestString(char * beforebrackets,char * inbrackets, char * afterbrack
 //others
 
 void AddtoOutput(char * allophones){
-	uint16_t p=slen(output);
-	uint16_t n=slen(allophones);
-	indent=3;
-	if(debug)printf("\n");
-	Doindent();
-	if(debug)printf("Add %i allophones ",n);
-	for (int x=0;x<n;x++){
-		output[p]=allophones[x];
-		if(debug)printf("%02X ",output[p]);
-		p++;
-		output[p]=0;
-		if (p>maxallophones){
-			printf("Allophone buffer Overrun\n");
-			p=0;
-			output[p]=0;
-		}
+    uint16_t p=slen(AlloBuffer);
+    uint16_t n=slen(allophones);
+    indent=3;
+    if(debug)printf("\n");
+    Doindent();
+    if(debug)printf("Add %i allophones ",n);
+    for (int x=0;x<n;x++){
+        AlloBuffer[p]=allophones[x];
+	if(debug)printf("%02X ",AlloBuffer[p]);
+	p++;
+	AlloBuffer[p]=0;
+	if (p>ALLOBUFFERMAX){
+	    printf("Allophone buffer Overrun\n");
+	    p=0;
+	    AlloBuffer[p]=0;
 	}
+    }
 #ifdef test
-	printf(" From 0x%X\n",LastRule);	
+    printf(" From 0x%X\n",LastRule);	
 #endif
-	if(debug)printf("\n");
+    if(debug)printf("\n");
 }	
 
 void PrintOutput(void){
-	char c=0;
-	uint16_t x=0;
-	if(debug)printf("Allophones (%i)\n",slen(output));
-	uint8_t d=0;
-	uint8_t l=0;
-    while((c=output[x])>0){
+    char c=0;
+    uint16_t x=0;
+    if(debug)printf("Allophones (%i)\n",slen(AlloBuffer));
+    uint8_t d=0;
+    uint8_t l=0;
+    while((c=AlloBuffer[x])>0){
 		if(c==Pa1){c=0;} //convert PA1 back to 0
 		if(format==2){
 			if(d==0){
@@ -1151,7 +1152,7 @@ int ruletest(void){
 	char beforebrackets[12];
 	char inbrackets[12];
 	char afterbrackets[12];
-	testoutput[0]=0;
+	testAlloBuffer[0]=0;
 	uint16_t p=0;
 	uint16_t bts;
 	for (R=0;Rules[R].RuleNo>0;R++){
@@ -1160,7 +1161,7 @@ int ruletest(void){
 		Doindent();
 		printf("\n ======= TEST RULE %i, Ox%X %c - ",R,Rules[R].RuleNo,Rules[R].letter);
 		TestRule=Rules[R].RuleNo;
-		//testoutput[0]=0;
+		//testAlloBuffer[0]=0;
 		bts=slen(testoutput);
 		//printf("Ext Brackets\n");
 		ExtractBrackets(R,beforebrackets,inbrackets,afterbrackets);
@@ -1187,7 +1188,7 @@ int ruletest(void){
 		PrintOutput();		
 		//reset test output and allophone output
 		testoutput[0]=0;
-		output[0]=0;
+		AlloBuffer[0]=0;
 	}
 	indent=0;
 	Doindent();
