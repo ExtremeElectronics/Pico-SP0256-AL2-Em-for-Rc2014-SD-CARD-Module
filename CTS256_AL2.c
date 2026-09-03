@@ -8,10 +8,15 @@
 //#define test 1
 
 //define for WBW
-#define WBW 0
+//#define WBW 0
 
 //set to 1 to provide default debug output.
-#define DEBUG 0
+#define DEBUG 1
+
+#ifdef test
+  //debug level if in test
+  #define DEBUG 1
+#endif
 
 //base rulez and exceptions
 #include "rules_array.c"
@@ -26,7 +31,7 @@ char output[4096]="";
 uint8_t debug=DEBUG;
 
 //output format - 0=hex, 1=decimal, 2=basic
-#define format 0
+#define format 2
 
 #ifdef test
 #define maxtestoutput 4096
@@ -77,7 +82,7 @@ int IsASuffixRight(char *Sentance , uint16_t sp){
 	for(x=0;x<elements;x++){
 		cnt=0;
 		for(y=0;SuffixsRight[x][y]!=0;y++){
-	        if(Sentance[sp+y]==SuffixsRight[x][y]){cnt++;}
+	        if(	Sentance[sp+y]==SuffixsRight[x][y]){cnt++;}
 		}
 		if(y==cnt){r=cnt;}		
 	}
@@ -94,7 +99,7 @@ int IsASibilantRight(char *Sentance , uint16_t sp){
 	for(x=0;x<elements;x++){
 		cnt=0;
 		for(y=0;SibilantsRight[x][y]!=0;y++){
-	        if(Sentance[sp+y]==SibilantsRight[x][y]){cnt++;}
+	        if(	Sentance[sp+y]==SibilantsRight[x][y]){cnt++;}
 		}
 		if(y==cnt){r=cnt;}		
 	}
@@ -180,19 +185,19 @@ int IsABackVowel(char *Sentance , uint16_t sp){
 }
 
 int IsNotLetter(char *Sentance , uint16_t sp){
-		int r=0;
-		return (Sentance[sp]<'A') || (Sentance[sp]>'Z') ;
+    int r=0;
+    return (Sentance[sp]<'A') || (Sentance[sp]>'Z') ;
 }
 
 
 int IsWhiteSpace(char *Sentance , uint16_t sp){
-		int r=0;
-		return Sentance[sp]==' ';
+    int r=0;
+    return Sentance[sp]==' ';
 }
 
 int IsALetter(char *Sentance , uint16_t sp){
-		int r=0;
-		return Sentance[sp]>='A';
+    int r=0;
+    return Sentance[sp]>='A';
 }
 
 
@@ -200,54 +205,55 @@ int IsALetter(char *Sentance , uint16_t sp){
 
 //match one or more vowels
 struct Match matchVowelsLeft(char *beforebrackets , uint16_t ptr, int16_t sentancelength){
-	struct Match m;
-	m.NumChars=0;
+    struct Match m;
+    m.NumChars=0;
     while((IsAVowel(beforebrackets,ptr-m.NumChars)==1) && ((ptr-m.NumChars)>0) ){m.NumChars++;}
-	m.Matched=(m.NumChars>0);
-	return m;
+    m.Matched=(m.NumChars>0);
+    return m;
 }
 //match one or more vowels
 struct Match matchVowelsRight(char *afterbrackets , uint16_t ptr, int16_t sentancelength){
-	struct Match m;
-	m.NumChars=0;
+    struct Match m;
+    m.NumChars=0;
     while((IsAVowel(afterbrackets ,ptr+m.NumChars)==1) && ((ptr+m.NumChars)<sentancelength) ){m.NumChars++;}
-	m.Matched=(m.NumChars>0);
-	return m;
+    m.Matched=(m.NumChars>0);
+    return m;
 }
 
-//match not a letter
+
+//match a letter
 struct Match matchLetterLeft(char *beforebrackets , uint16_t ptr, int16_t sentancelength){
     struct Match m;
-	m.NumChars=0;
+    m.NumChars=0;
     if((IsALetter(beforebrackets,ptr-m.NumChars)==1) && ((ptr-m.NumChars)>0) ){m.NumChars++;}
-	m.Matched=(m.NumChars>0);
-	return m;
+    m.Matched=(m.NumChars>0);
+    return m;
 }
 //match not a letter
 struct Match matchNoLetterLeft(char *beforebrackets , uint16_t ptr, int16_t sentancelength){
     struct Match m;
-	m.NumChars=0;
-    if((IsALetter(beforebrackets,ptr-m.NumChars)==0) && ((ptr-m.NumChars)>0) ){m.NumChars++;}
-	m.Matched=(m.NumChars>0);
-	return m;
+    m.NumChars=0;
+    if((IsNotLetter(beforebrackets,ptr-m.NumChars)==1)){m.NumChars++;}
+    m.Matched=(m.NumChars>0);
+    return m;
 }
 
 
 //match A Letter
 struct Match matchLetterRight(char *afterbrackets , uint16_t ptr, int16_t sentancelength){
-	struct Match m;
-	m.NumChars=0;
+    struct Match m;
+    m.NumChars=0;
     if((IsALetter(afterbrackets ,ptr+m.NumChars)==1) && ((ptr+m.NumChars)<sentancelength) ){m.NumChars++;}
-	m.Matched=(m.NumChars>0);
-	return m;
+    m.Matched=(m.NumChars>0);
+    return m;
 }
-//match A Letter
+//match NotA Letter
 struct Match matchNoLetterRight(char *afterbrackets , uint16_t ptr, int16_t sentancelength){
-	struct Match m;
-	m.NumChars=0;
-    if((IsALetter(afterbrackets ,ptr+m.NumChars)==0) && ((ptr+m.NumChars)<sentancelength) ){m.NumChars++;}
-	m.Matched=(m.NumChars>0);
-	return m;
+    struct Match m;
+    m.NumChars=0;
+    if((IsNotLetter(afterbrackets ,ptr+m.NumChars)==1)){m.NumChars++;}
+    m.Matched=(m.NumChars>0);
+    return m;
 }
 
 //match single voiced consonant
@@ -810,7 +816,7 @@ uint8_t lefthandmatch(char *beforebrackets,char *Sentance,uint16_t sp){
 	
 			//if match fails at any letter stop & return
 			if(m.Matched==0){
-			   if(debug)printf("MF ");
+			   //if(debug)printf("MF ");
 			   return 0;
 			}
 			
@@ -821,7 +827,13 @@ uint8_t lefthandmatch(char *beforebrackets,char *Sentance,uint16_t sp){
 			//printf("sp:%i \n",sp);
 		}
 		//printf("MBB %i\n",rr);
-		if(rr>=bbl){result=1;}
+		//if(rr>=bbl){result=1;}
+		//if(rr>=abl){result=1;}
+
+                //return matched chars limit matches to length
+                result=rr;
+                if(rr>bbl)result=bbl;
+
 	}
 	if(debug>1)printf("LM:%i ",result);
 	
@@ -842,6 +854,7 @@ uint8_t righthandmatch(char *afterbrackets,char *Sentance,uint16_t sp){
 	if(debug>1)printf("RHM %c ",Sentance[sp]);
 	uint8_t abl=slen(afterbrackets);
 	if (abl==0){
+	    //nothing to match return matched
 	    result=1; 
 	}else{
 		for (uint8_t b=0;b<abl;b++){
@@ -870,7 +883,7 @@ uint8_t righthandmatch(char *afterbrackets,char *Sentance,uint16_t sp){
 			
 			//if match fails at any letter
 			if(m.Matched==0){
-			   if(debug)printf("MF ");
+			   //if(debug)printf("MF ");
 			   return 0;
 			}
 			
@@ -879,7 +892,10 @@ uint8_t righthandmatch(char *afterbrackets,char *Sentance,uint16_t sp){
 			rr=rr+m.NumChars;
 		}
 		//printf("rhm %i %i - ",r,abl);
-		if(rr>abl){result=1;}
+		//if(rr>=abl){result=1;}
+		//return matched chars limit matches to length
+		result=rr;
+		if(rr>abl)result=abl;
 		
 	}
 	if(debug>1)printf("RM:%i ",result);
@@ -1021,7 +1037,7 @@ uint16_t MatchExeptionRule(char *Sentance , uint16_t sp){
 	uint8_t m=0;
 	while(RuleExceptions[x].exept[0]!=0){
 	    el=slen(RuleExceptions[x].exept);
-		if(debug>1)printf("Comparing %s(%i) %i\n",RuleExceptions[x].exept,el,wl);
+		if(debug>2)printf("Comparing %s(%i) %i\n",RuleExceptions[x].exept,el,wl);
 		
 	    m=0;
 	    //do lengths match?
@@ -1078,6 +1094,7 @@ int sayWBW(char * sentance){
                 if(R>0){sp=sp+R;}else{sp++;}
                 indent=0;
         }
+        //PrintOutput();
 
 }
 
@@ -1089,7 +1106,7 @@ int say(char * sentance,uint8_t matchonce){
 	
 	stringtoupper(sentance);
 	//printf("QfterToUpper\n");
-	printf("Sentance '%s' len:%i\n",sentance,slen(sentance));
+	printf("Sentance |%s| \n",sentance);
 	//while(sp<slen(sentance) && R>0){
 	while(sp<slen(sentance) ){
 		indent=0;
@@ -1121,7 +1138,7 @@ int say(char * sentance,uint8_t matchonce){
 	//flag is rule matches different to test rule
 #ifdef test
 	if (TestRule!=LastRule){
-	    printf("\n======= TestRule (0x%X), MatchedRule (0x%X) =======\n\n",TestRule,LastRule);
+	    printf("\n####### TestRule (0x%X), NOT MATCHED to Rule (0x%X) #######\n\n",TestRule,LastRule);
 	}
 #endif	
 	
@@ -1141,7 +1158,7 @@ int ruletest(void){
 		//printf("%i, Ox%X %c %s - ",R,Rules[R].RuleNo,Rules[R].letter,Rules[R].rule);
 		indent=0;
 		Doindent();
-		printf("\n ######## TEST RULE %i, Ox%X %c - ",R,Rules[R].RuleNo,Rules[R].letter);
+		printf("\n ======= TEST RULE %i, Ox%X %c - ",R,Rules[R].RuleNo,Rules[R].letter);
 		TestRule=Rules[R].RuleNo;
 		//testoutput[0]=0;
 		bts=slen(testoutput);
@@ -1191,7 +1208,7 @@ int main(int argc, char *argv[]) {
 	}else{
 	  if (argc==3){
 		  if (argv[2][0]=='D') debug=2;
-		  if (argv[2][0]=='d')debug=1;
+		  if (argv[2][0]=='d') debug=1;
       }
 	  say(argv[1],0);
 	  PrintOutput();
